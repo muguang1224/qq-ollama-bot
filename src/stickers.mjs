@@ -12,6 +12,7 @@ import zlib from 'node:zlib';
 import { join, extname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { ROOT } from './paths.mjs';
+import { which, execOpts } from './platform.mjs';
 
 export const STICKER_DIR = join(ROOT, 'stickers');
 export const INDEX_FILE = join(STICKER_DIR, 'index.json');
@@ -572,7 +573,7 @@ function parsePng(buf) {
  * 视觉模型从 46~200 秒降到 4.4 秒。
  */
 function shrinkJpegByReencode(buf, maxPx) {
-  const ff = process.env.FFMPEG_PATH || 'ffmpeg';
+  const ff = process.env.FFMPEG_PATH || which('ffmpeg') || 'ffmpeg';
   const tmpIn = join(STICKER_DIR, '.sz_' + Date.now() + '_in.jpg');
   const tmpOut = join(STICKER_DIR, '.sz_' + Date.now() + '_out.jpg');
   try {
@@ -580,7 +581,7 @@ function shrinkJpegByReencode(buf, maxPx) {
     // 同步调用，简单直接（这一步通常只要几十毫秒）
     execFileSync(ff, ['-y', '-v', 'error', '-i', tmpIn,
       '-vf', 'scale=' + maxPx + ':-1', '-q:v', '5', tmpOut],
-      { timeout: 15000, windowsHide: true, stdio: 'ignore' });
+      execOpts({ timeout: 15000, stdio: 'ignore' }));
     if (existsSync(tmpOut)) {
       const out = readFileSync(tmpOut);
       if (out.length > 100) return out;

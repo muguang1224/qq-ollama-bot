@@ -3,10 +3,12 @@
 用**本地大模型**驱动的 QQ 聊天机器人。不需要云端 API、不需要 API Key、不花一分钱。
 
 ```
-QQ 客户端  ←→  NapCat (OneBot v11)  ←→  本项目  ←→  Ollama (本地模型)
+QQ  ←→  NapCat (OneBot v11)  ←→  本项目  ←→  Ollama (本地模型)
 ```
 
 基于 [Ollama](https://ollama.com/) 跑推理，通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 收发 QQ 消息。
+
+**Windows / Linux / macOS 都能跑**（三个平台的启动脚本都带了，见下方「快速开始」）。
 
 ---
 
@@ -66,44 +68,97 @@ QQ 客户端  ←→  NapCat (OneBot v11)  ←→  本项目  ←→  Ollama (�
 
 - **Node.js** v20 或更新 —— <https://nodejs.org/>
 - **Ollama** —— <https://ollama.com/download>
-- **NapCat** —— <https://github.com/NapNeko/NapCatQQ/releases>
+- **NapCat** —— 见下面各平台说明
 - 一个**不常用的小号 QQ**（建议，避免和你的主号混在一起）
 
-### 第一步：安装
+先克隆下来：
 
 ```bash
 git clone https://github.com/muguang1224/qq-ollama-bot.git
 cd qq-ollama-bot
+```
+
+然后按你的系统选一套：
+
+---
+
+### Linux（推荐用 Docker 跑 NapCat）
+
+Linux 上 NapCat 的装法和 Windows 完全不同 —— **官方推荐用 Docker**，
+镜像里自带 QQ，不用折腾 xvfb、系统依赖和 QQ 授权。
+
+**1. 安装项目**
+
+```bash
+./安装.sh
+```
+
+它会检查 Node / Ollama / Docker，拉模型，生成配置。也可以 `./安装.sh --no-yolo` 跳过 YOLO。
+
+**2. 起 NapCat**
+
+先改 `docker-compose.yml` 里的 `WEBUI_TOKEN`（设个自己的随机串），然后：
+
+```bash
+docker compose up -d
+docker compose logs -f napcat     # 看日志：扫码 或 用 token 登 WebUI
+```
+
+> 首次需要扫码登录小号。二维码会打在日志里，也可以进
+> `http://127.0.0.1:6099` 用 `WEBUI_TOKEN` 登录。
+
+**3. 确认连接**
+
+在 NapCat WebUI 里进「网络配置」，确认有一个 **WebSocket 客户端**指向
+`ws://127.0.0.1:3001`。`docker-compose.yml` 用的 `MODE: ws` 已经配好了，
+端口也映射出来了，通常不用改。
+
+**4. 启动**
+
+```bash
+./启动.sh
+```
+
+看到 `已连接。等待 NapCat 推送消息…` 就成功了。
+
+> **不想用 Docker？** 官方也有一键脚本：
+> ```bash
+> curl -fL -o napcat.sh https://raw.githubusercontent.com/NapNeko/NapCat-Installer/main/script/install.sh
+> bash napcat.sh --docker n --cli y --github-proxy 0
+> ```
+> 装到 `~/Napcat`，运行 `napcat` 管理服务。
+
+---
+
+### Windows
+
+**1. 安装项目**
+
+双击 **`安装.bat`**，或者：
+
+```bash
 node 安装.mjs
 ```
 
-或者在 Windows 上直接**双击 `安装.bat`**。
-
-安装脚本会自动：
-1. 检查 Node 和 Ollama
-2. 拉取所需模型（聊天 2.7 GB + 视觉 3.2 GB）
-3. 生成 `config.json`
-4. 建好数据目录
-
-### 第二步：装 NapCat 并登录
+**2. 装 NapCat**
 
 1. 从 [NapCat Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载 `NapCat.Shell.Windows.OneKey.zip`
 2. 解压，运行 `NapCatInstaller.exe`
 3. 启动 NapCat，用小号扫码登录
 
-> **提示**：NapCat 一键安装器会下载一个 36 MB 的包。如果你在国内网络下失败，
+> **提示**：一键安装器会下载一个 36 MB 的包。国内网络下可能被截断，
 > 见下方「常见问题」。
 
-### 第三步：配置 OneBot 连接
+**3. 配置 OneBot 连接**
 
-NapCat 启动后，浏览器打开 `http://127.0.0.1:6099`（token 看启动日志）：
+浏览器打开 `http://127.0.0.1:6099`（token 看启动日志）：
 
 1. 进「网络配置」
 2. 新建 **WebSocket 客户端**（正向 WS）
 3. 地址填 `ws://127.0.0.1:3001`
 4. 保存并启用
 
-### 第四步：启动
+**4. 启动**
 
 双击 **`启动.bat`**，或者：
 
@@ -111,9 +166,16 @@ NapCat 启动后，浏览器打开 `http://127.0.0.1:6099`（token 看启动日�
 node src/bridge.mjs
 ```
 
-看到 `已连接。等待 NapCat 推送消息…` 就说明成功了。
+---
 
-**现在用你的主号给小号发条消息试试。**
+### macOS
+
+流程和 Linux 一样，NapCat 用官方 [NapCat-Mac-Installer](https://github.com/NapNeko/NapCat-Mac-Installer/releases/latest)。
+安装和启动都用 `.sh` 脚本。
+
+---
+
+**三个平台跑起来之后，用你的主号给小号发条消息试试。**
 
 ---
 
@@ -250,14 +312,14 @@ node src/换模型.mjs        # 查看/切换模型
 
 ```
 qq-ollama-bot/
-├── 安装.mjs / 安装.bat        ← 一键安装
-├── 启动.bat                   ← 一键启动
+├── 安装.bat / 安装.sh         ← 一键安装（Windows / Linux·macOS）
+├── 启动.bat / 启动.sh         ← 一键启动
+├── docker-compose.yml         ← Linux 上跑 NapCat 用
 ├── config.json               ← 配置（安装后生成）
-├── persona.mjs               ← 人设（从 example 生成）
-├── persona.example.mjs       ← 示例人设
 └── src/
     ├── bridge.mjs            ← 主程序
     ├── paths.mjs             ← 项目根定位（所有模块统一用它）
+    ├── platform.mjs          ← 跨平台小工具（路径/命令/可执行文件查找）
     ├── memory.mjs            ← 长期记忆 + 人设进化
     ├── emotion.mjs           ← 情绪系统
     ├── stickers.mjs          ← 表情包收集 / 视觉识别 / GIF 解码 / 图片缩放
@@ -357,6 +419,27 @@ const MEM_DIR = join(ROOT, 'memories');
 ```
 
 这样代码放哪都不会错，也不写死任何路径。有对应的单测覆盖了 5 种目录布局。
+
+### 跨平台是怎么做的（platform.mjs）
+
+项目最早只在 Windows 上跑，代码里散落着一些平台假设，迁到 Linux 时会踩坑。
+统一收进 `src/platform.mjs`：
+
+| 差异点 | Windows | Linux / macOS |
+| --- | --- | --- |
+| 找可执行文件 | `python`，要带 `.exe` | **`python3`**，无后缀 |
+| 查端口 | `netstat -ano` | **`ss -lntp`**（macOS 用 `lsof`） |
+| 子进程选项 | `windowsHide: true` | 无此选项 |
+| ffprobe | `ffprobe.exe` | `ffprobe` |
+
+其中**一个必出错的 bug**：拼表情包路径时原来的写法是
+
+```js
+const abs = (STICKER_DIR + '\\' + file).replace(/\\/g, '/');
+```
+
+Linux 上 `STICKER_DIR` 是 `/home/x/stickers`，加反斜杠会拼成
+`/home/x/stickers\a.gif` —— 路径直接废掉。现在改用 `join()` + `fileUrl()`。
 
 ### 关于 GIF
 
@@ -491,6 +574,58 @@ V1 版本有过这个问题，V2 已修。如果你还遇到，检查两点：
 模型没下载成功的话重跑 `node 安装.mjs`，或者手动去
 [ultralytics/assets](https://github.com/ultralytics/assets/releases/tag/v8.3.0)
 下 `yolo11n.onnx`、`yolo11n-pose.onnx`、`yolo11n-cls.onnx` 放进 `yolo-models/`。
+
+### Linux 相关
+
+**Q：`./启动.sh` 提示 Permission denied**
+
+```bash
+chmod +x 启动.sh 安装.sh
+```
+
+**Q：docker compose up 之后连不上 3001**
+
+按顺序查：
+
+```bash
+docker compose ps                      # 容器在跑吗
+docker compose logs -f napcat          # 登录了吗（要扫码）
+node src/检查NapCat.mjs                 # 端口在听吗
+```
+
+镜像里的 `MODE: ws` 已经开好正向 WebSocket 了，端口也映射到本机 ——
+一般只需要**扫码登录**这一步没做。
+
+**Q：端口绑的是 127.0.0.1，我要从另一台机器连**
+
+改 `docker-compose.yml` 的 ports，把 `127.0.0.1:` 去掉即可 ——
+但**这样会把 OneBot 暴露到局域网，务必同时给 OneBot 设 accessToken**。
+更安全的做法是用 SSH 端口转发：
+
+```bash
+ssh -L 3001:127.0.0.1:3001 user@server
+```
+
+**Q：Ollama 装完没跑起来**
+
+```bash
+sudo systemctl status ollama
+sudo systemctl start ollama
+# 或者前台跑一下看报错
+ollama serve
+```
+
+**Q：arm64（树莓派 / 甲骨文 ARM 机器）能跑吗**
+
+代码可以。但 `qwen3.5-4b` 在 ARM 上会很慢，建议换更小的模型：
+
+```bash
+ollama pull qwen2.5:1.5b
+node src/换模型.mjs --chat qwen2.5:1.5b
+```
+
+`qwen2.5vl:3b` 也要相应换成更小的视觉模型，或者直接
+`"vision": { "enabled": false }` 关掉看图。
 
 ---
 

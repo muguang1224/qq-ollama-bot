@@ -13,9 +13,10 @@
  *   node bridge.mjs --config a.json # 指定配置
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, statSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROOT } from './paths.mjs';
+import { fileUrl, platformLabel, IS_WINDOWS } from './platform.mjs';
 import { PERSONA, DEFAULTS } from './persona.mjs';
 import * as Mem from './memory.mjs';
 import * as AutoFriend from './autofriend.mjs';
@@ -137,6 +138,35 @@ function log(...a) {
 const memory = new Map();
 const MEM_LIMIT = 200; // 最多记多少个会话，防内存膨胀
 
+// ---------------------------------------------------------------- 上下文持久化
+//
+// 原来历史只存在内存里，**重启桥接就全丢** ——
+// 重启后第一句话，模型不知道刚才聊过什么，表现出来就是"前言不搭后语"。
+// 现在落盘到 <root>/context/<key>.json，重启后自动恢复。
+const CTX_DIR = join(ROOT, 'context');
+if (!existsSync(CTX_DIR)) mkdirSync(CTX_DIR, { recursive: true });
+
+const ctxFile = (key) => join(CTX_DIR, key.replace(/[:\\/*?"<>|]/g, '-') + '.json');
+
+/** 从磁盘读一个会话的历史 */
+function loadCtx(key) {
+  const f = ctxFile(key);
+  if (!existsSync(f)) return [];
+  try {
+    const j = JSON.parse(readFileSync(f, 'utf8'));
+    return Array.isArray(j.msgs) ? j.msgs : [];
+  } catch { return []; }
+}
+
+/** 写回磁盘（失败不影响聊天） */
+function saveCtx(key, msgs) {
+  try {
+    writeFileSync(ctxFile(key), JSON.stringify({
+      key, updatedAt: new Date().toISOString(), msgs,
+    }));
+  } catch { /* 写盘失败只影响持久化，不影响本轮回话 */ }
+}
+
 function memKey(ev) {
   return ev.message_type === 'group'
     ? 'g:' + ev.group_id
@@ -147,18 +177,33 @@ function memKey(ev) {
 function remember(key, role, content, keepTurns) {
   let arr = memory.get(key);
   if (!arr) {
-    arr = [];
+    // 首次访问这个会话：先从磁盘恢复（重启后不会失忆）
+    arr = loadCtx(key);
     // LRU：超限就丢最旧的
     if (memory.size >= MEM_LIMIT) memory.delete(memory.keys().next().value);
     memory.set(key, arr);
   }
   arr.push({ role, content });
   // 只保留最近 N 轮（1 轮 = user + assistant）
-  const max = keepTurns * 2;
+  const max = (keepTurns || 10) * 2;
   if (arr.length > max) arr.splice(0, arr.length - max);
+  saveCtx(key, arr);
 }
 
-function wipe(key) { memory.delete(key); }
+/** 读一个会话的历史（会从磁盘恢复） */
+function history(key) {
+  let arr = memory.get(key);
+  if (!arr) {
+    arr = loadCtx(key);
+    memory.set(key, arr);
+  }
+  return arr;
+}
+
+function wipe(key) {
+  memory.delete(key);
+  try { rmSync(ctxFile(key), { force: true }); } catch {}
+}
 
 // ---------------------------------------------------------------- Ollama
 
@@ -397,11 +442,12 @@ async function describeIncomingImages(bot, ev, key) {
     log('  👁 看到图片: ' + desc);
 
     // 写进上下文：让对方发的图变成一句"可读"的信息
-    const hist = memory.get(key);
+    const hist = history(key);
     if (hist && hist.length) {
       // 找到刚存进去的那条（最后一条 user）
       const last = [...hist].reverse().find((m) => m.role === 'user');
       if (last) last.content = (last.content || '') + '\n[对方发了一张图：' + desc + ']';
+      saveCtx(key, hist);   // 改完要落盘，否则重启后这次识别就丢了
     }
     // 记进 sticker 库的语义
     return desc;
@@ -458,10 +504,11 @@ async function describeIncomingVideo(bot, ev, key) {
 
     // 写进上下文
     const note = Video.renderVideoNote({ duration, summary });
-    const hist = memory.get(key);
+    const hist = history(key);
     if (hist && hist.length) {
       const last = [...hist].reverse().find((m) => m.role === 'user');
       if (last) last.content = (last.content || '') + note;
+      saveCtx(key, hist);
     }
     return { summary, duration, parts };
   } catch (e) {
@@ -516,13 +563,14 @@ async function describeIncomingAudio(bot, ev, key) {
     if (text) {
       log('  🎤 语音内容: 「' + text + '」');
       // 写进上下文：把占位的 [语音] 换成真实内容
-      const hist = memory.get(key);
+      const hist = history(key);
       if (hist && hist.length) {
         const last = [...hist].reverse().find((m) => m.role === 'user');
         if (last) {
           last.content = String(last.content || '').replace(/\[语音\]/g, '') +
             '\n[对方发了一条语音，说：' + text + ']';
         }
+        saveCtx(key, hist);
       }
       return { text };
     }
@@ -579,6 +627,9 @@ async function maybeFollowUp(bot, ev, key, emoRec, userText, reply) {
 
     if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, d.message);
     else await bot.sendPrivate(ev.user_id, d.message);
+
+    // 补的话也要进历史，否则下一轮模型不知道它自己刚说过什么
+    remember(key, 'assistant', d.message, cfg_cache.cfg?.reply?.contextTurns ?? 10);
 
     Proactive.markFollowUp(key);
     log('  💬 补一句: ' + d.message + '   [' + d.reason + ']');
@@ -718,9 +769,12 @@ async function maybeSendSticker(bot, ev, emoRec, userText, reply) {
   const st = await pickStickerByModel(bot, ev, emoRec, userText, reply, sc);
   if (!st) return;
 
-  const abs = (StickerDirAbs + '\\' + st.file).replace(/\\/g, '/');
+  // 用 join 拼路径，再用 fileUrl 转成 OneBot 认的形式。
+  // 原来是 (dir + '\\' + file).replace(/\\/g,'/') —— Linux 上必然出错：
+  // STICKER_DIR 是 /home/x/stickers，加反斜杠会变成 /home/x/stickers\a.gif
+  const abs = fileUrl(join(StickerDirAbs, st.file));
   try {
-    const msg = [{ type: 'image', data: { file: 'file:///' + abs } }];
+    const msg = [{ type: 'image', data: { file: abs } }];
     if (ev.message_type === 'group') await bot.call('send_group_msg', { group_id: ev.group_id, message: msg });
     else await bot.call('send_private_msg', { user_id: ev.user_id, message: msg });
     Stickers.markSent(st.id);
@@ -861,7 +915,7 @@ function startProactive(bot, cfg) {
       // 让对方模型先想一下：现在该不该开口
       const key = 'p:' + target;
       const rec = Mem.load(key);
-      const hist = (memory.get(key) || []).slice(-6)
+      const hist = history(key).slice(-6)
         .map((m) => (m.role === 'user' ? '对方' : '你') + '：' + m.content)
         .join('\n');
 
@@ -897,6 +951,15 @@ function startProactive(bot, cfg) {
       }
 
       await bot.sendPrivate(target, message);
+
+      // ★ 必须把它自己说过的话记进历史 ★
+      //
+      // 之前漏了这一步，导致"前言不搭后语"：
+      //   机器人主动说「刚看到个视频笑死 你睡觉了没」
+      //   用户回「没有，下午三点我睡什么觉」
+      //   下一轮模型看不到自己问过什么 → 反过来说"你咋突然问这个"
+      remember(key, 'assistant', message, cfg.reply.contextTurns);
+
       state = Proactive.markSent(state, target, message);
       Proactive.saveState(state);
       awaitingReply.set(key, { since: Date.now(), text: message });
@@ -1098,6 +1161,7 @@ async function main() {
 
   log('='.repeat(56));
   log('QQ ↔ 本地模型桥 启动');
+  log('平台: ' + platformLabel() + '   根目录: ' + ROOT);
   log('模型: ' + cfg.ollama.model + ' @ ' + cfg.ollama.baseUrl);
   log('人格: ' + PERSONA.split('\n')[0].replace(/^你是/, '').slice(0, 40));
   log('='.repeat(56));
@@ -1180,7 +1244,7 @@ async function main() {
     if (cfg.video?.enabled !== false && hasVideoSeg(ev)) {
       // 让模型知道"对方发了个视频，我在看"，免得它当作没收到
       try {
-        const hist = memory.get(key);
+        const hist = history(key);
         if (hist && hist.length) {
           const last = [...hist].reverse().find((m) => m.role === 'user');
           if (last && !/\[对方发了一段视频/.test(String(last.content || ''))) {
@@ -1228,9 +1292,32 @@ async function main() {
       const systemPrompt = PERSONA + Mem.render(rec, cfg.bot.name) +
         (cfg.emotion?.enabled !== false ? Emo.render(emoRec) : '');
 
+      // 取上下文：不包括"刚存进去的这条"（下面会单独作为 user 消息传入）
+      //
+      // 原来写的是 slice(0, -1)，假设"最后一条一定是刚存的 text"。
+      // 但这个假设不牢：媒体识别会改写历史条目，并发消息也可能插进来，
+      // 一旦假设不成立就会【误删一条真实对话】，表现为模型失忆。
+      // 现在改成从尾部找到那条内容相同的再排除，更稳。
+      const ctxHist = history(key).slice();
+      if (
+        ctxHist.length &&
+        ctxHist[ctxHist.length - 1].role === 'user' &&
+        ctxHist[ctxHist.length - 1].content === text
+      ) {
+        ctxHist.pop();
+      } else {
+        // 兜底：从尾部往前找第一条内容匹配的（媒体识别可能给它加了后缀）
+        for (let i = ctxHist.length - 1; i >= Math.max(0, ctxHist.length - 4); i--) {
+          if (ctxHist[i].role === 'user' && String(ctxHist[i].content || '').startsWith(text)) {
+            ctxHist.splice(i, 1);
+            break;
+          }
+        }
+      }
+
       const msgs = [
         { role: 'system', content: systemPrompt },
-        ...(memory.get(key) || []).slice(0, -1), // 不含刚存进去的这条
+        ...ctxHist,
         { role: 'user', content: text },
       ];
       const raw = await ollamaChat(msgs, cfg);
@@ -1254,7 +1341,7 @@ async function main() {
       Mem.save(rec);
       const every = cfg.reply.evolveEvery ?? 4;
       if (every > 0 && rec.turns - rec.evolvedTurns >= every) {
-        const hist = memory.get(key) || [];
+        const hist = history(key);
         evolveInBackground(rec, hist, cfg, key);
       }
     } catch (e) {

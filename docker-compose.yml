@@ -1,0 +1,31 @@
+# NapCat + OneBot —— 供本项目的 Linux 部署使用
+#
+# 用法：
+#   1. 改下面的 WEBUI_TOKEN（随便设一个，记下来）
+#   2. docker compose up -d
+#   3. docker compose logs -f napcat   # 看日志里的二维码或用 token 进 WebUI
+#
+# 说明：
+#   · NapCat 官方镜像里已经带了 QQ，不需要另外装
+#   · 端口只绑到 127.0.0.1，外网访问不到（机器人也在本机，够用）
+#   · data/ 目录保存登录态，删了要重新扫码
+
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: unless-stopped
+    environment:
+      # 正向 WebSocket 模式（本项目默认连 127.0.0.1:3001）
+      MODE: ws
+      # ⚠️ 改成一个你自己的随机串，用来登 WebUI
+      WEBUI_TOKEN: change-me-to-a-random-token
+      # 可选：填了就是快速登录，不用每次扫码（有风控风险，建议先不填）
+      # NAPCAT_UID: "123456789"
+    ports:
+      - "127.0.0.1:6099:6099"   # NapCat WebUI
+      - "127.0.0.1:3001:3001"   # OneBot 正向 WebSocket（本项目连这个）
+    volumes:
+      - ./data/qq:/app/.config/QQ
+      - ./data/config:/app/napcat/config
+      - ./data/plugins:/app/napcat/plugins

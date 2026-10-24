@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync, readFileSync } fr
 import { join, extname } from 'node:path';
 import { execFile } from 'node:child_process';
 import { ROOT } from './paths.mjs';
+import { which, execOpts, ffprobeFrom } from './platform.mjs';
 
 const WORK = join(ROOT, '.video-work');
 if (!existsSync(WORK)) mkdirSync(WORK, { recursive: true });
@@ -47,17 +48,17 @@ export function isVoiceSeg(seg) {
   return /\.(amr|silk|slk|mp3|wav|m4a|ogg|aac)$/i.test(String(f));
 }
 
-/** 找 ffmpeg：配置 > PATH > 常见位置 */
+/** 找 ffmpeg：配置 > PATH（跨平台，Windows 上会找 ffmpeg.exe） */
 function findFfmpeg(cfg) {
   if (cfg?.video?.ffmpeg && existsSync(cfg.video.ffmpeg)) return cfg.video.ffmpeg;
-  // 让 execFile 用 PATH；Windows 会自己找 ffmpeg.exe
-  return 'ffmpeg';
+  const found = which('ffmpeg');
+  return found || 'ffmpeg';
 }
 
 /** 跑外部命令，分开返回 stdout / stderr */
 function run(cmd, args, timeout) {
   return new Promise((resolve) => {
-    execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 1024 * 1024 * 8 },
+    execFile(cmd, args, execOpts({ timeout, maxBuffer: 1024 * 1024 * 8 }),
       (err, stdout, stderr) => resolve({
         ok: !err,
         err: err?.message || '',
@@ -83,13 +84,18 @@ async function probeDuration(file, cfg) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-/** 找 ffprobe：和 ffmpeg 同目录 */
+/** 找 ffprobe：和 ffmpeg 同目录（跨平台处理 .exe 后缀） */
 function findFfprobe(cfg) {
+  const configured = cfg?.video?.ffprobe;
+  if (configured && existsSync(configured)) return configured;
+
   const ff = findFfmpeg(cfg);
-  if (!ff || ff === 'ffmpeg') return 'ffprobe';   // 走 PATH
-  if (/ffmpeg\.exe$/i.test(ff)) return ff.replace(/ffmpeg\.exe$/i, 'ffprobe.exe');
-  if (/ffmpeg$/i.test(ff)) return ff.replace(/ffmpeg$/i, 'ffprobe');
-  return 'ffprobe';
+  const guess = ffprobeFrom(ff);
+  // 配置里给了明确路径时，从它推同目录的 ffprobe
+  if (ff && ff !== 'ffmpeg' && existsSync(guess)) return guess;
+
+  const found = which('ffprobe');
+  return found || guess;
 }
 
 /**

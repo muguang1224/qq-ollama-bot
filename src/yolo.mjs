@@ -19,10 +19,11 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, isAbsolute, resolve } from 'node:path';
 import { ROOT } from './paths.mjs';
+import { which, execOpts } from './platform.mjs';
 
 export const YOLO_DEFAULTS = {
   enabled: true,
-  python: 'python',
+  python: '',          // 留空则自动找 python3 / python
   script: '',          // 留空则用 modelDir 下的 yolo.py
   modelDir: '',        // 留空则用 <root>/yolo-models
   timeoutMs: 30000,
@@ -67,10 +68,10 @@ export function unavailableReason(cfg) {
 /** 跑一次推理 */
 function run(py, script, args, cwd, timeoutMs) {
   return new Promise((resolve) => {
-    execFile(py, [script, ...args], {
-      cwd, timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 * 4,
+    execFile(py, [script, ...args], execOpts({
+      cwd, timeout: timeoutMs, maxBuffer: 1024 * 1024 * 4,
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
-    }, (err, stdout, stderr) => {
+    }), (err, stdout, stderr) => {
       if (err && !stdout) {
         return resolve({ ok: false, error: (err.message || '').slice(0, 150) + (stderr ? ' | ' + String(stderr).slice(0, 150) : '') });
       }
@@ -99,7 +100,25 @@ export async function analyze(imagePath, cfg, mode = 'all') {
   const abs = isAbsolute(imagePath) ? imagePath : resolve(process.cwd(), imagePath);
   if (!existsSync(abs)) return { ok: false, error: '图片不存在: ' + abs };
 
-  return run(c.python, script, [mode, abs], dir, c.timeoutMs);
+  return run(pythonCmd(c), script, [mode, abs], dir, c.timeoutMs);
+}
+
+/**
+ * 找可用的 Python 解释器。
+ *
+ * 跨平台差异：Windows 上通常是 python，Linux/macOS 上通常是 python3。
+ * 配置里显式写了就用配置的。
+ */
+let _pyCache = null;
+function pythonCmd(c) {
+  if (c.python && c.python !== 'python') return c.python;   // 用户明确指定
+  if (_pyCache) return _pyCache;
+
+  for (const name of ['python3', 'python']) {
+    if (which(name)) { _pyCache = name; return name; }
+  }
+  _pyCache = c.python || 'python3';
+  return _pyCache;
 }
 
 /**
