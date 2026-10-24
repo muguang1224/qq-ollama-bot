@@ -24,6 +24,7 @@ import * as Proactive from './proactive.mjs';
 import * as Emo from './emotion.mjs';
 import * as Stickers from './stickers.mjs';
 import * as Video from './video.mjs';
+import * as Qzone from './qzone.mjs';
 
 // ---------------------------------------------------------------- 配置
 
@@ -49,6 +50,10 @@ const EXAMPLE = {
     name: '小鲸鱼',
     adminQQ: 0,
     _adminQQ说明: '你的 QQ 号。填了之后只有你能用管理命令。',
+    owner: 0,
+    _owner说明: '主人 QQ 号。填了之后这个人在对话里被当作主人，称呼用 ownerName。0 = 不启用。',
+    ownerName: '主人',
+    _ownerName说明: '怎么称呼主人。例：爸爸 / 老板 / 哥。',
   },
   reply: { ...DEFAULTS },
   autoAccept: {
@@ -94,6 +99,7 @@ const EXAMPLE = {
     _说明: '语音处理：用 fetch_ptt_text 把语音转成文字。',
     enabled: true,
   },
+  qzone: { ...Qzone.QZONE_DEFAULTS },
 };
 
 function loadConfig() {
@@ -117,6 +123,7 @@ function loadConfig() {
     followUp: { enabled: true, chance: 0.3, ...(raw.followUp || {}) },
     video: { enabled: true, frames: 3, width: 256, maxMB: 80, ...(raw.video || {}) },
     audio: { enabled: true, ...(raw.audio || {}) },
+    qzone: { ...Qzone.QZONE_DEFAULTS, ...(raw.qzone || {}) },
   };
 }
 
@@ -262,7 +269,50 @@ function sanitize(text) {
   return t.trim();
 }
 
+// ---------------------------------------------------------------- 记忆渲染
+
+/**
+ * 把人物档案渲染成 system prompt 片段。
+ * 统一入口：把「主人」配置（cfg.bot.owner / ownerName）一并传下去，
+ * 这样 memory.mjs 不需要硬编码任何 QQ 号，公开仓库里也不会泄漏个人信息。
+ */
+function renderMemory(rec, cfg) {
+  return Mem.render(rec, cfg.bot?.name, {
+    ownerQQ: cfg.bot?.owner || 0,
+    ownerName: cfg.bot?.ownerName || '主人',
+  });
+}
+
 // ---------------------------------------------------------------- 触发判断
+
+/**
+ * 群聊「对话状态」登记表：group_id -> 过期时间戳
+ *
+ * 为什么需要：
+ *   群聊默认只在被 @ 时回复。但 @ 一次之后，对方往往会连着说几句，
+ *   如果每句都要重新 @，体验很割裂（截图里的问题）。
+ *   所以被 @（或命中前缀）后，接下来 groupSessionMs 毫秒内，
+ *   该群的普通消息也会回复；超时自动退出，避免长期刷屏。
+ */
+const groupSession = new Map();
+const GROUP_SESSION_MS_DEFAULT = 5 * 60 * 1000; // 5 分钟
+
+/** 该群是否处于对话状态 */
+function inGroupSession(groupId, cfg) {
+  const until = groupSession.get(String(groupId));
+  if (!until) return false;
+  if (Date.now() > until) {
+    groupSession.delete(String(groupId));
+    return false;
+  }
+  return true;
+}
+
+/** 进入/续期对话状态 */
+function touchGroupSession(groupId, cfg) {
+  const ms = cfg.reply?.groupSessionMs ?? GROUP_SESSION_MS_DEFAULT;
+  if (ms > 0) groupSession.set(String(groupId), Date.now() + ms);
+}
 
 function shouldReply(ev, cfg, selfId) {
   // 自己发的消息不回复
@@ -272,15 +322,26 @@ function shouldReply(ev, cfg, selfId) {
   if (isPrivate) return !!cfg.reply.privateReply;
 
   // 群聊
-  if (!cfg.reply.groupReply) {
-    // 群聊总开关关着时，只放行 @ 和前缀
-    const text = plainText(ev);
-    if (cfg.reply.replyOnAt && isAtMe(ev, selfId)) return true;
-    if (cfg.reply.groupPrefixes?.some((p) => text.startsWith(p))) return true;
-    return false;
+  const text = plainText(ev);
+  const atMe = cfg.reply.replyOnAt && isAtMe(ev, selfId);
+  const byPrefix = cfg.reply.groupPrefixes?.some((p) => text.startsWith(p));
+
+  // 被 @ 或命中前缀 → 一定回复，并且开启/续期对话状态
+  if (atMe || byPrefix) {
+    touchGroupSession(ev.group_id, cfg);
+    return true;
   }
-  // 总开关开着时，也允许按 @ 限制
-  return true;
+
+  // 群聊全开
+  if (cfg.reply.groupReply) return true;
+
+  // 处于对话状态 → 也回复（这就是「@ 一次后能连续聊」）
+  if (inGroupSession(ev.group_id, cfg)) {
+    touchGroupSession(ev.group_id, cfg); // 有互动就续期
+    return true;
+  }
+
+  return false;
 }
 
 function isAtMe(ev, selfId) {
@@ -876,6 +937,9 @@ function moodWord(r) {
 /** 等待对方回复的登记表：key -> { since, text } */
 const awaitingReply = new Map();
 
+/** 上次回复时间：key -> 时间戳（用于 reply.cooldownMs 限速，防群聊刷屏） */
+const lastReplyAt = new Map();
+
 /**
  * 主动聊天调度器。
  * 每 2 分钟检查一次：现在适合开口吗？该找谁？说什么？
@@ -902,7 +966,24 @@ function startProactive(bot, cfg) {
       let friends = [];
       try {
         const list = await bot.call('get_friend_list');
-        friends = (list || []).map((f) => String(f.user_id)).filter((id) => id !== String(bot.selfId));
+        // 关键：排除自己。
+        // 注意 QQ 允许"自己加自己为好友"，所以自己会出现在好友列表里。
+        // bot.selfId 在连接刚建立时可能还是 null，这里现取一次做双保险。
+        let selfId = bot.selfId;
+        if (!selfId) {
+          try {
+            const me = await bot.call('get_login_info');
+            selfId = me?.user_id;
+            if (selfId) bot.selfId = selfId;
+          } catch {}
+        }
+        const selfStr = selfId != null ? String(selfId) : null;
+        friends = (list || [])
+          .map((f) => String(f.user_id))
+          .filter((id) => selfStr === null || id !== selfStr);
+        if (selfStr !== null && (list || []).some((f) => String(f.user_id) === selfStr)) {
+          log('主动聊天：已从好友列表排除自己（' + selfStr + '）');
+        }
       } catch (e) {
         log('主动聊天：取好友列表失败 ' + e.message);
         return;
@@ -925,7 +1006,7 @@ function startProactive(bot, cfg) {
       if (cfg.proactive.thinkBeforeSend) {
         const d = await Proactive.thinkWhetherToSpeak({
           persona: PERSONA,
-          about: Mem.render(rec, cfg.bot.name),
+          about: renderMemory(rec, cfg),
           recent: hist,
           now: new Date(),
         }, cfg);
@@ -938,7 +1019,7 @@ function startProactive(bot, cfg) {
       } else {
         // 不走思考：直接让模型基于记忆生成一句
         const msgs = [
-          { role: 'system', content: PERSONA + Mem.render(rec, cfg.bot.name) },
+          { role: 'system', content: PERSONA + renderMemory(rec, cfg) },
           { role: 'user', content: '（现在没人跟你说话。你主动开个话题，说一句简短自然的话。只输出要发的内容。）' },
         ];
         message = sanitize(await ollamaChat(msgs, cfg));
@@ -987,6 +1068,64 @@ function startProactive(bot, cfg) {
       awaitingReply.delete(key);
     }
   }, 60000);
+}
+
+// ---------------------------------------------------------------- QQ 空间
+
+function startQzone(bot, cfg) {
+  const q = cfg.qzone || {};
+  if (!q.enabled) {
+    log('QQ空间：未开启（config.json 的 qzone.enabled）');
+    return;
+  }
+
+  log('QQ空间：已开启，每天最多 ' + q.maxPerDay + ' 条，活跃时段 ' +
+      q.activeStart + '-' + q.activeEnd + ' 点');
+
+  // 统一的模型调用（复用 ollamaChat）
+  const chat = (messages, opt = {}) => ollamaChat(messages, {
+    ...cfg,
+    reply: {
+      ...cfg.reply,
+      maxTokens: opt.numPredict ?? cfg.reply.maxTokens,
+      temperature: opt.temperature ?? cfg.reply.temperature,
+    },
+  });
+
+  // 从 OneBot 拿 QQ空间凭证
+  // 注意：本项目的 bot.call() 已经把 ev.data 解包后返回，
+  //      所以 r 直接就是 { cookies: "..." }，没有 r.status / r.data 外层。
+  //      这里两种格式都兼容，避免换实现时又踩坑。
+  const getCred = async () => {
+    const r = await bot.call('get_cookies', { domain: 'user.qzone.qq.com' });
+    const cookieStr = r?.cookies || r?.data?.cookies;
+    if (!cookieStr) {
+      const why = r?.message || r?.wording || (r ? JSON.stringify(r).slice(0, 120) : '无返回');
+      throw new Error('拿不到 QQ空间凭证: ' + why);
+    }
+    const { parseCookies, calcBkn } = await import('./qzone-api.mjs');
+    const ck = parseCookies(cookieStr);
+    const pSkey = ck.p_skey || ck.skey || '';
+    return {
+      raw: cookieStr,
+      uin: (ck.uin || '').replace(/^o/, ''),
+      pSkey,
+      g_tk: calcBkn(pSkey),
+    };
+  };
+
+  const tick = async () => {
+    try {
+      await Qzone.maybePublish({ chat, cfg, log, getCred });
+    } catch (e) {
+      log('QQ空间出错：' + e.message);
+    }
+  };
+
+  // 首次延迟 3 分钟（等桥接稳定），之后按配置间隔检查
+  const everyMs = (q.checkEveryMin || 60) * 60000;
+  setTimeout(tick, 3 * 60000);
+  setInterval(tick, everyMs);
 }
 
 // ---------------------------------------------------------------- OneBot 客户端
@@ -1265,6 +1404,23 @@ async function main() {
 
     if (!shouldReply(ev, cfg, bot.selfId)) return;
 
+    // —— 回复冷却 ——
+    // 群聊全开后，如果不限速，群里每句话都会立刻被回复，很容易刷屏被踢。
+    // cooldownMs 之前只是个没被使用的配置项，这里真正接上：
+    //   · 同一个人（私聊）或同一个群（群聊）在冷却期内的消息不再回复
+    //   · 冷却只影响"回不回"，消息仍会进历史，所以上下文不会断
+    {
+      const cdMs = cfg.reply?.cooldownMs ?? 0;
+      if (cdMs > 0) {
+        const now = Date.now();
+        const last = lastReplyAt.get(key) || 0;
+        if (now - last < cdMs) {
+          log('  （冷却中，跳过回复，距上次 ' + ((now - last) / 1000).toFixed(1) + 's）');
+          return;
+        }
+      }
+    }
+
     // 管理命令
     if (cfg.bot.adminQQ && String(ev.user_id) === String(cfg.bot.adminQQ)) {
       if (text === '/reset' || text === '重置') {
@@ -1289,7 +1445,7 @@ async function main() {
       const rec = Mem.load(key);
       // 情绪状态也拼进去 —— 让数值真的影响说话
       const emoRec = Emo.load(key);
-      const systemPrompt = PERSONA + Mem.render(rec, cfg.bot.name) +
+      const systemPrompt = PERSONA + renderMemory(rec, cfg) +
         (cfg.emotion?.enabled !== false ? Emo.render(emoRec) : '');
 
       // 取上下文：不包括"刚存进去的这条"（下面会单独作为 user 消息传入）
@@ -1330,6 +1486,9 @@ async function main() {
       else await bot.sendPrivate(ev.user_id, reply);
       log('  回复: ' + reply);
 
+      // 记录本次回复时间，供冷却判断使用
+      lastReplyAt.set(key, Date.now());
+
       // —— 按情绪决定要不要配一张表情包 ——
       await maybeSendSticker(bot, ev, emoRec, text, reply);
 
@@ -1367,8 +1526,14 @@ async function main() {
   if (cfg.onebot.reversePort) await bot.connectReverse();
   else bot.connectForward();
 
+  // 等 OneBot 真正连上（最多 30 秒），再启动需要调 API 的调度器
+  for (let i = 0; i < 60 && !bot.ready; i++) await new Promise((r) => setTimeout(r, 500));
+
   // 主动聊天调度器
   startProactive(bot, cfg);
+
+  // QQ空间自动发说说
+  startQzone(bot, cfg);
 
   // 表情库后台标注：空闲时慢慢把没收据的图"看"一遍
   if (cfg.vision?.enabled !== false) {

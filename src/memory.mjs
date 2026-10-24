@@ -147,10 +147,20 @@ export function forget(key) {
 }
 
 /** 把档案渲染成给模型看的上下文片段 */
-export function render(rec, botName) {
+export function render(rec, botName, opts = {}) {
   const parts = [];
 
-  if (rec.knownAs) parts.push('你叫对方「' + rec.knownAs + '」。');
+  // —— 主人身份：优先于一切，且不受「人设进化」覆盖 ——
+  // 进化会把 knownAs 改成它自己学到的叫法，这里强制纠回配置的称呼。
+  // owner 配置来自 config.json 的 bot.owner（见 bridge.mjs），这里不硬编码任何 QQ 号。
+  const ownerQQ = opts.ownerQQ ? String(opts.ownerQQ) : '';
+  const ownerName = opts.ownerName || '主人';
+  const isOwner = ownerQQ && rec.key === 'p:' + ownerQQ;
+  if (isOwner) {
+    parts.push('【这个人是你主人，QQ ' + ownerQQ + '】你叫他「' + ownerName + '」。这是固定称呼，别改成别的。');
+  }
+
+  if (rec.knownAs && !isOwner) parts.push('你叫对方「' + rec.knownAs + '」。');
 
   if (rec.facts?.length) {
     parts.push('你知道的关于对方的事：\n' + rec.facts.map((s) => '- ' + s).join('\n'));
@@ -158,8 +168,10 @@ export function render(rec, botName) {
   if (rec.topics?.length) {
     parts.push('你们之前聊过：\n' + rec.topics.map((s) => '- ' + s).join('\n'));
   }
-  if (rec.attitude) {
+  if (rec.attitude && !isOwner) {
     parts.push('你对这个人的态度：' + rec.attitude);
+  } else if (isOwner) {
+    parts.push('你对他的态度：亲近，可以贫嘴、可以吐槽他，但心里认他。');
   }
 
   if (parts.length) {
@@ -197,6 +209,12 @@ const EVOLVE_PROMPT = `你在维护一个 QQ 角色扮演机器人的「人物�
 
 /** 让模型从对话里提炼档案更新 */
 export async function evolve(rec, history, cfg) {
+  // 主人档案的称呼和态度由配置固定，不让"进化"把它改掉。
+  // 同样不硬编码 QQ 号：从 cfg.bot.owner 读。
+  const ownerQQ = cfg?.bot?.owner ? String(cfg.bot.owner) : '';
+  const ownerName = cfg?.bot?.ownerName || '主人';
+  const isOwner = ownerQQ && rec.key === 'p:' + ownerQQ;
+
   // 只取文本形式的历史
   const convo = history
     .map((m) => (m.role === 'user' ? '对方' : '你') + '：' + m.content)
@@ -205,11 +223,11 @@ export async function evolve(rec, history, cfg) {
 
   const archive = JSON.stringify(
     {
-      knownAs: rec.knownAs,
+      knownAs: isOwner ? '(固定：' + ownerName + '，不要改)' : rec.knownAs,
       facts: rec.facts,
       topics: rec.topics,
       tics: rec.tics,
-      attitude: rec.attitude,
+      attitude: isOwner ? '(固定：亲近，可贫嘴)' : rec.attitude,
     },
     null, 2
   );
@@ -266,5 +284,12 @@ export async function evolve(rec, history, cfg) {
     version: rec.version + 1,
     evolvedTurns: rec.turns,
   };
+
+  // 主人档案：称呼和态度由配置固定，覆盖模型可能给出的任何值
+  if (isOwner) {
+    next.knownAs = ownerName;
+    next.attitude = '亲近，可贫嘴';
+  }
+
   return next;
 }
