@@ -1,0 +1,196 @@
+#!/usr/bin/env node
+/**
+ * 一键安装
+ * 用法: node 安装.mjs
+ *
+ * 做四件事：
+ *   1. 检查 Node / Ollama
+ *   2. 自动拉取所需模型（聊天 + 视觉）
+ *   3. 生成 config.json
+ *   4. 建好数据目录
+ *
+ * 不写死任何路径，任何人 clone 下来都能跑。
+ */
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const CHAT_MODEL = 'qwen3.5-4b';
+const VISION_MODEL = 'qwen2.5vl:3b';
+
+const OK = (s) => '  ✅ ' + s;
+const NO = (s) => '  ❌ ' + s;
+const WA = (s) => '  ⚠️  ' + s;
+const STEP = (n, s) => '\n[' + n + '] ' + s;
+
+console.log('='.repeat(64));
+console.log('  QQ 本地模型机器人 —— 一键安装');
+console.log('='.repeat(64));
+
+let fatal = 0;
+
+// ---------------------------------------------------------------- 1. Node
+console.log(STEP(1, 'Node.js'));
+const major = Number(process.version.slice(1).split('.')[0]);
+if (major >= 20) console.log(OK('Node ' + process.version));
+else {
+  console.log(NO('Node ' + process.version + ' 太旧，需要 v20+'));
+  console.log('    下载: https://nodejs.org/');
+  fatal++;
+}
+
+// ---------------------------------------------------------------- 2. Ollama
+console.log(STEP(2, 'Ollama'));
+let ollamaOk = false;
+try {
+  const r = await fetch('http://127.0.0.1:11434/api/version', { signal: AbortSignal.timeout(5000) });
+  const j = await r.json();
+  console.log(OK('Ollama 运行中，版本 ' + j.version));
+  ollamaOk = true;
+} catch {
+  console.log(NO('连不上 Ollama'));
+  console.log('    请先安装并启动: https://ollama.com/download');
+  console.log('    装好后重新运行本脚本。');
+  fatal++;
+}
+
+// ---------------------------------------------------------------- 3. 模型
+console.log(STEP(3, '拉取模型'));
+console.log('  聊天模型: ' + CHAT_MODEL + '   （约 2.7 GB）');
+console.log('  视觉模型: ' + VISION_MODEL + '   （约 3.2 GB）');
+console.log();
+
+if (ollamaOk) {
+  let have = [];
+  try {
+    const r = await fetch('http://127.0.0.1:11434/api/tags');
+    have = (( await r.json()).models || []).map((m) => m.name);
+  } catch {}
+
+  const { execSync } = await import('node:child_process');
+
+  for (const m of [CHAT_MODEL, VISION_MODEL]) {
+    const base = m.split(':')[0];
+    const already = have.some((n) => n === m || n.startsWith(base + ':'));
+    if (already) { console.log(OK(m + ' 已存在，跳过')); continue; }
+
+    console.log('  正在拉取 ' + m + ' ...');
+    try {
+      execSync('ollama pull ' + m, { stdio: 'inherit', timeout: 3600000 });
+      console.log(OK(m + ' 完成'));
+    } catch (e) {
+      console.log(WA(m + ' 拉取失败，可以稍后手动执行: ollama pull ' + m));
+    }
+  }
+} else {
+  console.log(WA('Ollama 没起来，跳过。装好后手动执行:'));
+  console.log('    ollama pull ' + CHAT_MODEL);
+  console.log('    ollama pull ' + VISION_MODEL);
+}
+
+// ---------------------------------------------------------------- 4. 配置
+console.log(STEP(4, '生成配置'));
+
+// 数据目录
+for (const d of ['memories', 'emotions', 'stickers', 'proactive', 'logs']) {
+  const p = join(ROOT, d);
+  if (!existsSync(p)) { mkdirSync(p, { recursive: true }); console.log('  建目录 ' + d + '/'); }
+}
+
+// config.json
+const cfgPath = join(ROOT, 'config.json');
+if (existsSync(cfgPath)) {
+  console.log(OK('config.json 已存在，保留（不覆盖你的设置）'));
+} else {
+  const cfg = {
+    _说明: '配置。none of these are secrets except onebot.accessToken — keep that private.',
+    onebot: {
+      _说明: 'NapCat 的 OneBot 连接方式。正向 WS 用 url；反向 WS 用 reversePort。',
+      url: 'ws://127.0.0.1:3001',
+      accessToken: '',
+      reversePort: 0,
+    },
+    ollama: { baseUrl: 'http://127.0.0.1:11434', model: CHAT_MODEL },
+    bot: {
+      name: '小助手',
+      adminQQ: 0,
+      _adminQQ说明: '你自己的 QQ 号，填了之后只有你能用管理命令（如 /reset）。',
+    },
+    reply: {
+      privateReply: true,
+      groupReply: false,
+      replyOnAt: true,
+      groupPrefixes: ['小助手'],
+      contextTurns: 10,
+      evolveEvery: 4,
+      maxTokens: 200,
+      temperature: 0.85,
+      timeoutMs: 60000,
+      cooldownMs: 1500,
+    },
+    autoAccept: {
+      _说明: '自动处理加好友/入群申请。默认全关。',
+      enabled: false, friend: false, groupJoin: false, groupInvite: false,
+      acceptAnyone: false, whitelist: [], blacklist: [], requireKeyword: '', maxPerHour: 5,
+    },
+    proactive: {
+      _说明: '主动聊天。想让它偶尔主动找人说话就改成 true。',
+      enabled: false, targets: [], allFriends: false,
+      minGapMin: 40, maxGapMin: 80, maxPerHour: 1,
+      quietStart: 1, quietEnd: 8, thinkBeforeSend: true,
+      skipIfIgnored: 2, cooldownAfterColdMin: 360,
+    },
+    emotion: {
+      enabled: true,
+      moodUpOnPraise: 6, moodUpOnCare: 3, moodDownOnInsult: 8, moodDownOnCold: 2,
+      moodDriftTo: 55, moodDriftRate: 0.05,
+      intimacyUpPerMsg: 1.2, intimacyDecayPerDay: 4,
+      nightStart: 23, nightEnd: 7, energyDrainNight: 6, energyRecoverDay: 3,
+    },
+    stickers: {
+      _说明: '表情包收集与发送。',
+      enabled: true, chance: 0.25, cooldownMin: 20,
+    },
+    vision: {
+      _说明: '用视觉模型"看"图片。',
+      enabled: true, model: VISION_MODEL, batch: 3, gapMs: 5000,
+    },
+  };
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
+  console.log(OK('已生成 config.json'));
+  console.log('    → 记得把 bot.adminQQ 改成你的 QQ 号');
+}
+
+// persona.mjs（放在 src/ 下，和 bridge.mjs 同目录）
+const personaPath = join(ROOT, 'src', 'persona.mjs');
+const examplePath = join(ROOT, 'src', 'persona.example.mjs');
+if (existsSync(personaPath)) {
+  console.log(OK('persona.mjs 已存在，保留（不覆盖你改过的人设）'));
+} else if (existsSync(examplePath)) {
+  copyFileSync(examplePath, personaPath);
+  console.log(OK('已从 persona.example.mjs 生成 persona.mjs'));
+  console.log('    → 想改性格就编辑 src/persona.mjs，或运行 node src/人设卡.mjs');
+} else {
+  console.log(WA('没找到 persona.example.mjs，请确认文件完整'));
+}
+
+// ---------------------------------------------------------------- 完成
+console.log('\n' + '='.repeat(64));
+if (fatal) {
+  console.log('  ❌ 有 ' + fatal + ' 个必须先解决的问题，见上面');
+  console.log('='.repeat(64));
+  process.exit(1);
+}
+
+console.log('  ✅ 安装完成');
+console.log('='.repeat(64));
+console.log();
+console.log('接下来:');
+console.log('  1. 装 NapCat 并登录 QQ（详见 README）');
+console.log('  2. 在 NapCat WebUI 里开 WebSocket 客户端 → ws://127.0.0.1:3001');
+console.log('  3. 改 config.json 的 bot.adminQQ');
+console.log('  4. 双击 启动.bat（或 node src/bridge.mjs）');
+console.log();
+console.log('先自检一下: node src/检查环境.mjs');
+console.log();

@@ -1,0 +1,28 @@
+{
+  "name": "qq-ollama-bot",
+  "version": "1.0.0",
+  "description": "QQ bot powered by a local LLM (Ollama). No cloud API, no API key. QQ messages via NapCat / OneBot v11.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "install:setup": "node 安装.mjs",
+    "start": "node src/bridge.mjs",
+    "check": "node src/检查环境.mjs",
+    "check:napcat": "node src/检查NapCat.mjs",
+    "persona": "node src/人设卡.mjs",
+    "try": "node src/试试.mjs",
+    "model": "node src/换模型.mjs"
+  },
+  "keywords": [
+    "qq",
+    "onebot",
+    "napcat",
+    "ollama",
+    "local-llm",
+    "chatbot"
+  ]
+}
