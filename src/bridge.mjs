@@ -13,7 +13,7 @@
  *   node bridge.mjs --config a.json # 指定配置
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PERSONA, DEFAULTS } from './persona.mjs';
@@ -22,10 +22,10 @@ import * as AutoFriend from './autofriend.mjs';
 import * as Proactive from './proactive.mjs';
 import * as Emo from './emotion.mjs';
 import * as Stickers from './stickers.mjs';
+import * as Video from './video.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// 项目根目录（src 的上一级）。config/日志/数据都放这里，
-// 让代码和用户数据分开。
+// 项目根目录（src 的上一级）。config/日志/数据都放这里，让代码和用户数据分开。
 const ROOT = dirname(__dirname);
 
 // ---------------------------------------------------------------- 配置
@@ -81,6 +81,22 @@ const EXAMPLE = {
     batch: 3,
     gapMs: 5000,
   },
+  followUp: {
+    _说明: '会话内追问：回复后有时再补一句，让对话不是一问一答就结束。',
+    enabled: true,
+    chance: 0.3,
+  },
+  video: {
+    _说明: '视频处理：下载后抽帧识别。注意这只是"看几张截图"，不是真的理解视频。',
+    enabled: true,
+    frames: 3,
+    width: 256,
+    maxMB: 80,
+  },
+  audio: {
+    _说明: '语音处理：用 fetch_ptt_text 把语音转成文字。',
+    enabled: true,
+  },
 };
 
 function loadConfig() {
@@ -101,6 +117,9 @@ function loadConfig() {
     emotion: { ...Emo.EMOTION_DEFAULTS, ...(raw.emotion || {}) },
     stickers: { enabled: true, chance: 0.25, cooldownMin: 20, ...(raw.stickers || {}) },
     vision: { enabled: true, model: 'qwen2.5vl:3b', batch: 3, gapMs: 5000, ...(raw.vision || {}) },
+    followUp: { enabled: true, chance: 0.3, ...(raw.followUp || {}) },
+    video: { enabled: true, frames: 3, width: 256, maxMB: 80, ...(raw.video || {}) },
+    audio: { enabled: true, ...(raw.audio || {}) },
   };
 }
 
@@ -240,8 +259,20 @@ function plainText(ev) {
       if (s.type === 'at') return '@' + (s.data?.qq || '');
       if (s.type === 'image') return '[图片]';
       if (s.type === 'face') return '[表情]';
+      // QQ 的表情包有多种类型，之前漏了这些 → 整条消息变空
+      if (s.type === 'mface' || s.type === 'marketface' || s.type === 'bface') {
+        const sum = s.data?.summary || s.data?.text || '';
+        return '[表情包' + (sum ? ':' + sum : '') + ']';
+      }
       if (s.type === 'record') return '[语音]';
-      return '';
+      if (s.type === 'video') return '[视频]';
+      if (s.type === 'file') return '[文件:' + (s.data?.name || s.data?.file || '') + ']';
+      if (s.type === 'json' || s.type === 'xml') return '[卡片消息]';
+      if (s.type === 'forward' || s.type === 'node') return '[聊天记录]';
+      if (s.type === 'poke') return '[戳一戳]';
+      if (s.type === 'reply') return '';
+      // 未知类型也标出来，避免整条消息变空
+      return '[' + s.type + ']';
     })
     .join('')
     .trim();
@@ -293,15 +324,16 @@ function collectStickers(bot, ev, text, key) {
   const segs = ev.message;
   if (!Array.isArray(segs)) return;
 
-  const media = segs.filter((s) => ['image', 'face', 'mface', 'marketface'].includes(s.type));
+  const media = segs.filter((s) => ['image', 'mface', 'marketface', 'bface'].includes(s.type));
   if (!media.length) return;
 
   // 用对方这句话作为这张图的"使用场景"
-  const context = text && text.length >= 2 && text !== '[图片]' ? text : '';
+  // 注意：纯媒体消息（没文字）时 text 会是 "[图片]" 这类占位，不算有效场景
+  const context = text && !/^\[[^\]]*\]$/.test(text.trim()) ? text : '';
 
   for (const seg of media) {
     const d = seg.data || {};
-    const file = d.file || d.file_id || '';
+    const file = d.file || d.file_id || d.url || d.path || '';
     if (!file) continue;
 
     collecting++;
@@ -346,11 +378,12 @@ async function describeIncomingImages(bot, ev, key) {
   const segs = ev.message;
   if (!Array.isArray(segs)) return;
 
-  const media = segs.filter((s) => ['image', 'face', 'mface', 'marketface'].includes(s.type));
+  const media = segs.filter((s) => ['image', 'mface', 'marketface', 'bface'].includes(s.type));
   if (!media.length) return;
 
   const seg = media[0];   // 只处理第一张，避免拖慢
-  const file = seg.data?.file || seg.data?.file_id;
+  // 不同消息段的文件字段名不一样，都试一遍
+  const file = seg.data?.file || seg.data?.file_id || seg.data?.url || seg.data?.path;
   if (!file) return;
 
   try {
@@ -381,12 +414,274 @@ async function describeIncomingImages(bot, ev, key) {
   }
 }
 
+/**
+ * 让对方发的视频"被看见"。
+ *
+ * 做法：get_file 下载 → ffmpeg 抽几帧 → 逐帧交给视觉模型 → 拼成描述。
+ *
+ * 重要限制（要在上下文里说清楚，否则模型会以为它真看懂了）：
+ *   - 这只是抽了几帧，不知道过程，也听不到声音
+ *   - 抽帧宽度必须 ≤256，512 会因内存不足失败
+ */
+async function describeIncomingVideo(bot, ev, key) {
+  if (cfg_cache.video?.enabled === false) return;
+  const segs = ev.message;
+  if (!Array.isArray(segs)) return;
+
+  const seg = segs.find((s) => Video.isVideoSeg(s));
+  if (!seg) return;
+
+  const file = seg.data?.file || seg.data?.file_id || seg.data?.url;
+  if (!file) return;
+
+  try {
+    log('  🎬 收到视频，正在取文件…');
+    const r = await bot.call('get_file', { file }, 120000);
+    const local = r?.file;
+    if (!local || !existsSync(local)) {
+      log('  🎬 视频文件拿不到，跳过');
+      return;
+    }
+
+    const sizeMB = (safeStatSize(local) / 1048576).toFixed(1);
+    log('  🎬 已下载 ' + sizeMB + ' MB，抽帧中…');
+
+    const { frames, duration, error } = await Video.extractFrames(local, cfg_cache.cfg || {});
+    if (error) { log('  🎬 抽帧失败: ' + error); return; }
+    if (!frames.length) { log('  🎬 没抽到帧'); return; }
+
+    log('  🎬 抽到 ' + frames.length + ' 帧，识别中…');
+    const { summary, parts } = await Video.describeVideo(
+      frames, cfg_cache.cfg || {}, Stickers.describe, log
+    );
+    Video.cleanupFrames(frames);
+
+    if (!summary) { log('  🎬 帧识别都没成功'); return; }
+
+    log('  🎬 视频内容: ' + summary.slice(0, 70));
+
+    // 写进上下文
+    const note = Video.renderVideoNote({ duration, summary });
+    const hist = memory.get(key);
+    if (hist && hist.length) {
+      const last = [...hist].reverse().find((m) => m.role === 'user');
+      if (last) last.content = (last.content || '') + note;
+    }
+    return { summary, duration, parts };
+  } catch (e) {
+    log('  🎬 视频处理出错: ' + e.message);
+  }
+}
+
+function safeStatSize(p) {
+  try { return statSync(p).size; } catch { return 0; }
+}
+
+/**
+ * 让对方发的语音"被听懂"。
+ *
+ * 实测要点（重要）：
+ *   - fetch_ptt_text 只传 message_id/raw_message 会超时失败
+ *   - 必须同时传 file 字段才成功
+ *   - 返回 { text: "识别出的文字" }
+ *   - 失败时退回 get_record 转 mp3（但没做语音识别，只能拿到音频）
+ */
+async function describeIncomingAudio(bot, ev, key) {
+  if (cfg_cache.audio?.enabled === false) return;
+  const segs = ev.message;
+  if (!Array.isArray(segs)) return;
+
+  const seg = segs.find((s) => Video.isVoiceSeg(s));
+  if (!seg) return;
+
+  const file = seg.data?.file;
+  if (!file) return;
+
+  try {
+    log('  🎤 收到语音，尝试转文字…');
+
+    // 关键：必须带 file。实测只传 message_id/raw_message 会超时失败，
+    // 带上 file 就能成功。另外语音刚收到时腾讯侧可能还没处理完，
+    // 所以失败要重试几次。
+    let text = '';
+    for (let attempt = 1; attempt <= 3 && !text; attempt++) {
+      try {
+        const r = await bot.call('fetch_ptt_text', { message_id: ev.message_id, file }, 30000);
+        text = String(r?.text ?? r?.data?.text ?? (typeof r === 'string' ? r : '')).trim();
+      } catch (e) {
+        if (attempt < 3) await new Promise((res) => setTimeout(res, 1500 * attempt));
+      }
+      if (!text && attempt < 3) {
+        log('  🎤 第 ' + attempt + ' 次失败，重试…');
+        await new Promise((res) => setTimeout(res, 1500 * attempt));
+      }
+    }
+
+    if (text) {
+      log('  🎤 语音内容: 「' + text + '」');
+      // 写进上下文：把占位的 [语音] 换成真实内容
+      const hist = memory.get(key);
+      if (hist && hist.length) {
+        const last = [...hist].reverse().find((m) => m.role === 'user');
+        if (last) {
+          last.content = String(last.content || '').replace(/\[语音\]/g, '') +
+            '\n[对方发了一条语音，说：' + text + ']';
+        }
+      }
+      return { text };
+    }
+
+    const size = seg.data?.file_size ? Number(seg.data.file_size) : 0;
+    log('  🎤 语音转文字失败（重试 3 次）' + (size ? '，音频 ' + (size / 1024).toFixed(0) + 'KB' : ''));
+    return null;
+  } catch (e) {
+    log('  🎤 语音处理出错: ' + e.message);
+  }
+}
+
+/**
+ * 会话内追问：回复之后，有时再补一句。
+ *
+ * 为什么要做：真人聊天不是一问一答就结束，
+ * 常常会追问、会分享、会接着聊。这一步让它更像真人。
+ *
+ * 用概率控制，避免每条都补（那样很烦）。
+ * 情绪和关系会提高概率：心情好、关系熟 → 更愿意多聊。
+ */
+async function maybeFollowUp(bot, ev, key, emoRec, userText, reply) {
+  const fc = cfg_cache.followUp || {};
+  if (fc.enabled === false) return;
+
+  // 概率基础值
+  let chance = fc.chance ?? 0.3;
+  if (emoRec.mood >= 75) chance += 0.15;
+  if (emoRec.mood <= 35) chance -= 0.2;
+  if (emoRec.intimacy >= 60) chance += 0.1;
+  if (emoRec.intimacy <= 10) chance -= 0.15;
+  chance = Math.max(0, Math.min(0.75, chance));
+
+  // 冷却：同一会话短时间内不连续补
+  if (!Proactive.canFollowUp(key, cfg_cache.cfg || {})) return;
+  if (Math.random() > chance) return;
+
+  try {
+    const d = await Proactive.thinkFollowUp({
+      persona: PERSONA,
+      userText,
+      reply,
+      now: new Date(),
+    }, cfg_cache.cfg || {});
+
+    if (!d.follow || !d.message) {
+      if (d.reason && d.reason !== 'JSON 解析失败') log('  💬 不补话（' + d.reason + '）');
+      return;
+    }
+
+    // 稍微延迟一下，像真人在打字
+    const delay = 1200 + Math.floor(Math.random() * 1800);
+    await new Promise((r) => setTimeout(r, delay));
+
+    if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, d.message);
+    else await bot.sendPrivate(ev.user_id, d.message);
+
+    Proactive.markFollowUp(key);
+    log('  💬 补一句: ' + d.message + '   [' + d.reason + ']');
+  } catch (e) {
+    log('  💬 补话失败: ' + e.message);
+  }
+}
+
+/**
+ * 并发的媒体理解 + 超时保护。
+ *
+ * 为什么这么做：
+ *   原来三个 media 处理是串行 await。视频要下载 + 抽帧 + 逐帧识别，
+ *   一卡就是几十秒，**回复被拖死甚至完全不回**（实测踩过）。
+ *
+ * 现在：
+ *   - 三种媒体并发跑
+ *   - 各自有超时，图片 25s / 语音 20s / 视频 45s
+ *   - 超时或失败都不影响回复，只是这次没"看懂"
+ */
+// 视频在后台跑，可以给足时间；图片/语音是同步等的，要短
+const MEDIA_TIMEOUT = { image: 20000, audio: 15000, video: 120000 };
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' 超时 ' + (ms / 1000) + 's')), ms)),
+  ]);
+}
+
+async function understandMedia(bot, ev, key, opt = {}) {
+  const segs = Array.isArray(ev.message) ? ev.message : [];
+  if (!segs.length) return;
+
+  const hasImage = segs.some((s) => ['image', 'mface', 'marketface', 'bface'].includes(s.type));
+  const hasVideo = !opt.skipVideo && segs.some((s) => Video.isVideoSeg(s));
+  const hasAudio = segs.some((s) => Video.isVoiceSeg(s));
+
+  const jobs = [];
+  if (hasImage) {
+    jobs.push(withTimeout(describeIncomingImages(bot, ev, key), MEDIA_TIMEOUT.image, '图片识别')
+      .catch((e) => log('  ⚠️ ' + e.message + '，跳过这次看图')));
+  }
+  if (hasAudio) {
+    jobs.push(withTimeout(describeIncomingAudio(bot, ev, key), MEDIA_TIMEOUT.audio, '语音识别')
+      .catch((e) => log('  ⚠️ ' + e.message + '，跳过这次听语音')));
+  }
+  if (hasVideo) {
+    jobs.push(withTimeout(describeIncomingVideo(bot, ev, key), MEDIA_TIMEOUT.video, '视频识别')
+      .catch((e) => log('  ⚠️ ' + e.message + '，跳过这次看视频')));
+  }
+
+  if (!jobs.length) return;
+
+  const t0 = Date.now();
+  await Promise.all(jobs);
+  log('  📎 媒体理解完成，耗时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
+}
+
+/** 这条消息里有没有视频 */
+function hasVideoSeg(ev) {
+  const segs = Array.isArray(ev.message) ? ev.message : [];
+  return segs.some((s) => Video.isVideoSeg(s));
+}
+
+/**
+ * 视频后台理解。
+ *
+ * 视频要下载 + 抽帧 + 逐帧识别，几十秒起步。
+ * **绝不能让它挡住回复** —— 所以丢到后台，
+ * 理解到的内容写进上下文，下一轮聊天时它就知道那个视频是什么了。
+ */
+const videoBusy = new Set();
+
+function understandVideoInBackground(bot, ev, key) {
+  // 同一个人同时只处理一个视频，避免堆积拖垮机器
+  if (videoBusy.has(key)) { log('  🎬 已有视频在处理，跳过'); return; }
+  videoBusy.add(key);
+
+  const t0 = Date.now();
+  withTimeout(describeIncomingVideo(bot, ev, key), MEDIA_TIMEOUT.video, '视频识别')
+    .then((r) => {
+      if (r?.summary) {
+        log('  🎬 视频已理解（耗时 ' + ((Date.now() - t0) / 1000).toFixed(0) + 's），下轮对话可用');
+      }
+    })
+    .catch((e) => log('  ⚠️ ' + e.message + '（不影响回复）'))
+    .finally(() => videoBusy.delete(key));
+}
+
 /** 缓存配置引用（供 collectStickers 使用） */
 /** 配置缓存（模块级函数用它，避免拿不到 main() 里的 cfg） */
 const cfg_cache = {
   stickerCollect: true,
   vision: true,
   stickers: { enabled: true, chance: 0.25, cooldownMin: 20 },
+  followUp: { enabled: true, chance: 0.3 },
+  video: { enabled: true, frames: 3, width: 256, maxMB: 80 },
+  audio: { enabled: true },
   cfg: null,
 };
 
@@ -645,6 +940,7 @@ class OneBot {
     this.ready = false;
     this.handlers = new Map();
     this.pending = new Map(); // echo -> {resolve, reject}
+    this.seen = new Set();   // 已处理的消息 id，用于去重
     this.echo = 0;
     this.retry = 0;
   }
@@ -732,6 +1028,18 @@ class OneBot {
     }
 
     if (ev.post_type === 'message') {
+      // 去重：NapCat 偶尔会重复推送同一条
+      const mid = ev.message_id;
+      if (mid !== undefined && this.seen.has(mid)) return;
+      if (mid !== undefined) {
+        this.seen.add(mid);
+        if (this.seen.size > 500) {
+          // 只留最近的，避免无限增长
+          const arr = [...this.seen].slice(-300);
+          this.seen = new Set(arr);
+        }
+      }
+
       const fn = this.handlers.get('message');
       if (fn) fn(ev).catch((e) => log('处理消息出错: ' + e.message));
       return;
@@ -787,6 +1095,9 @@ async function main() {
   cfg_cache.stickerCollect = cfg.stickers?.enabled !== false;
   cfg_cache.stickers = cfg.stickers || {};
   cfg_cache.vision = cfg.vision?.enabled !== false;
+  cfg_cache.followUp = cfg.followUp || {};
+  cfg_cache.video = cfg.video || {};
+  cfg_cache.audio = cfg.audio || {};
   cfg_cache.cfg = cfg;
 
   log('='.repeat(56));
@@ -859,10 +1170,31 @@ async function main() {
       collectStickers(bot, ev, text, key);
     } catch (e) { log('  表情收集失败: ' + e.message); }
 
-    // —— 让模型"看到"图片：把描述拼进上下文 ——
-    try {
-      await describeIncomingImages(bot, ev, key);
-    } catch (e) { log('  图片识别失败: ' + e.message); }
+    // —— 媒体理解：图片 / 语音（快，同步等）——
+    //
+    // 实测踩过的坑：原来把视频也串行 await，视频要下载+抽帧+逐帧识别，
+    // 一卡就是几十秒，**回复被拖死甚至完全不回**。
+    //
+    // 现在分两档：
+    //   - 图片(≤1s)、语音(≤2s)：同步等，这样回复时就能用上内容
+    //   - 视频(几十秒)：丢到后台跑，【先回复】再说
+    await understandMedia(bot, ev, key, { skipVideo: true });
+
+    // 视频单独后台处理：先回复，理解结果留给下一轮
+    if (cfg.video?.enabled !== false && hasVideoSeg(ev)) {
+      // 让模型知道"对方发了个视频，我在看"，免得它当作没收到
+      try {
+        const hist = memory.get(key);
+        if (hist && hist.length) {
+          const last = [...hist].reverse().find((m) => m.role === 'user');
+          if (last && !/\[对方发了一段视频/.test(String(last.content || ''))) {
+            last.content = String(last.content || '') +
+              '\n[对方发了一段视频，你还没看完，可以先应一声]';
+          }
+        }
+      } catch {}
+      understandVideoInBackground(bot, ev, key);
+    }
 
     // —— 情绪更新：分析这条消息对心情/亲密度的影响 ——
     try {
@@ -917,6 +1249,9 @@ async function main() {
 
       // —— 按情绪决定要不要配一张表情包 ——
       await maybeSendSticker(bot, ev, emoRec, text, reply);
+
+      // —— 会话内追问：有时再补一句，让对话不是一问一答就结束 ——
+      await maybeFollowUp(bot, ev, key, emoRec, text, reply);
 
       // —— 人设进化：每 N 轮后台提炼一次，不阻塞回复 ——
       rec.turns += 1;

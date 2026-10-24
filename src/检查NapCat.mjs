@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 const OK = (s) => '  ✅ ' + s;
 const NO = (s) => '  ❌ ' + s;
 
-// ---- 自动定位 NapCat ----
+/** 自动定位 NapCat：在项目目录、桌面、下载目录里找 NapCat* */
 function findNapCat() {
   if (process.argv[2]) return process.argv[2];
 
@@ -27,7 +27,9 @@ function findNapCat() {
     for (const e of entries) {
       if (!/^NapCat/i.test(e)) continue;
       const p = join(d, e);
+      // 可能就是 Shell 目录
       if (existsSync(join(p, 'versions'))) return p;
+      // 或者里面还有一层
       try {
         for (const sub of readdirSync(p)) {
           const sp = join(p, sub);
@@ -59,7 +61,10 @@ console.log('\n[1] 目录布局');
 console.log(existsSync(join(shell, 'QQ.exe')) ? OK('QQ.exe（自带的 QQ）') : NO('缺 QQ.exe'));
 
 const versRoot = join(shell, 'versions');
-if (!existsSync(versRoot)) { console.log(NO('缺 versions 目录')); process.exit(1); }
+if (!existsSync(versRoot)) {
+  console.log(NO('缺 versions 目录 —— 可能还没跑过安装器'));
+  process.exit(1);
+}
 const vers = readdirSync(versRoot).filter((e) => {
   try { return statSync(join(versRoot, e)).isDirectory(); } catch { return false; }
 });
@@ -70,7 +75,7 @@ console.log(OK('QQ 版本: ' + ver));
 const napdir = join(versRoot, ver, 'resources', 'app', 'napcat');
 if (!existsSync(napdir)) {
   console.log(NO('缺 napcat 注入目录 —— Shell 包没解压完整'));
-  console.log('    → 重新下载完整的 NapCat.Shell.zip');
+  console.log('    → 重新下载完整的 NapCat.Shell.zip（约 36MB）');
   process.exit(1);
 }
 console.log(OK('注入目录存在'));
@@ -89,7 +94,7 @@ if (!existsSync(pkt)) {
   for (const f of files) console.log('  · ' + f);
   if (files.find((f) => /win32/i.test(f))) console.log(OK('Windows 组件齐全，可以启动'));
   else {
-    console.log(NO('缺 Windows 组件 MoeHoo.win32.x64.node'));
+    console.log(NO('缺 Windows 组件（MoeHoo.win32.x64.node）'));
     console.log('    → NapCat.Shell.zip 下载不完整，需重新下载');
   }
 }

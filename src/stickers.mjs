@@ -12,6 +12,7 @@ import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 
+// 数据存在项目根目录（src 的上一级），与代码分开
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const STICKER_DIR = join(ROOT, 'stickers');
 export const INDEX_FILE = join(STICKER_DIR, 'index.json');
@@ -47,14 +48,27 @@ export async function describe(filePath, cfg, timeoutMs = 90000) {
   const model = cfg.vision?.model || 'qwen2.5vl:3b';
   let imgBuf = null;
 
-  const ext = extname(filePath).toLowerCase();
-  if (['.jpg', '.jpeg', '.png'].includes(ext)) {
-    imgBuf = readFileSync(filePath);
-  } else if (ext === '.gif') {
-    imgBuf = gifToPng(filePath);          // 纯 JS 转首帧，无需 ffmpeg
-    if (!imgBuf) throw new Error('GIF 解码失败');
+  // 关键：用魔数判断真实格式，不能信扩展名。
+  // 实测 QQ 的动画表情文件名叫 .jpg，内容却是 GIF。
+  const raw = readFileSync(filePath);
+  const fmt = sniffFormat(raw);
+
+  if (fmt === 'jpg' || fmt === 'png') {
+    imgBuf = raw;
+  } else if (fmt === 'gif' || fmt === 'webp' || fmt === 'bmp') {
+    // GIF 用内置解码器；webp/bmp 也试着当 GIF 之外处理
+    if (fmt === 'gif') {
+      imgBuf = gifToPng(filePath);
+      if (!imgBuf) throw new Error('GIF 解码失败');
+    } else {
+      throw new Error('暂不支持 ' + fmt + ' 格式（需要转换）');
+    }
   } else {
-    throw new Error('不支持的图片格式: ' + ext);
+    // 认不出：退回扩展名
+    const ext = extname(filePath).toLowerCase();
+    if (ext === '.gif') { imgBuf = gifToPng(filePath); }
+    else imgBuf = raw;
+    if (!imgBuf) throw new Error('无法识别的图片格式');
   }
 
   const b64 = imgBuf.toString('base64');
@@ -386,18 +400,42 @@ function addContext(item, ctx) {
   if (item.contexts.length > 12) item.contexts.shift();  // 只留最近 12 条
 }
 
-/** 猜扩展名 */
+/**
+ * 判断文件真实扩展名。
+ *
+ * ⚠️ 必须用魔数优先，不能信文件名：
+ *   实测 QQ 发来的动画表情，file 字段写的是 ".jpg"，
+ *   但实际内容是 GIF（GIF89a）。信文件名会导致：
+ *     - 存成 .jpg
+ *     - describe() 看到 .jpg 就不做 GIF 转换
+ *     - 视觉模型报 "image: unknown format"
+ */
 function guessExt(buf, meta) {
-  const fromName = meta.fileName ? extname(meta.fileName).toLowerCase() : '';
-  if (fromName && ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(fromName)) return fromName;
-  // 用魔数判断
-  if (buf.length > 4) {
-    if (buf[0] === 0xff && buf[1] === 0xd8) return '.jpg';
-    if (buf[0] === 0x89 && buf[1] === 0x50) return '.png';
-    if (buf[0] === 0x47 && buf[1] === 0x49) return '.gif';
-    if (buf.slice(0, 4).toString('ascii') === 'RIFF') return '.webp';
+  if (buf && buf.length > 8) {
+    const b0 = buf[0], b1 = buf[1];
+    if (b0 === 0x47 && b1 === 0x49 && buf[2] === 0x46) return '.gif';      // GIF8
+    if (b0 === 0x89 && b1 === 0x50 && buf[2] === 0x4e) return '.png';      // PNG
+    if (b0 === 0xff && b1 === 0xd8 && buf[2] === 0xff) return '.jpg';      // JPEG
+    if (buf.slice(0, 4).toString('ascii') === 'RIFF' &&
+        buf.slice(8, 12).toString('ascii') === 'WEBP') return '.webp';     // WebP
+    if (b0 === 0x42 && b1 === 0x4d) return '.bmp';                          // BMP
   }
+  // 魔数认不出时才退回文件名
+  const fromName = meta.fileName ? extname(meta.fileName).toLowerCase() : '';
+  if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(fromName)) return fromName;
   return '.jpg';
+}
+
+/** 读魔数判断真实格式（给 describe 用） */
+function sniffFormat(buf) {
+  if (!buf || buf.length < 8) return 'unknown';
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'gif';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e) return 'png';
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' &&
+      buf.slice(8, 12).toString('ascii') === 'WEBP') return 'webp';
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
+  return 'unknown';
 }
 
 /** 已收集的统计 */

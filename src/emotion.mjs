@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// 数据存在项目根目录（src 的上一级），与代码分开
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EMO_DIR = join(ROOT, 'emotions');
 if (!existsSync(EMO_DIR)) mkdirSync(EMO_DIR, { recursive: true });
@@ -23,7 +24,7 @@ export const EMOTION_DEFAULTS = {
   moodUpOnCare: 3,        // 被关心
   moodDownOnInsult: 8,    // 被骂
   moodDownOnCold: 2,      // 被冷落
-  moodDriftTo: 55,        // 自然回归的基准值
+  moodDriftTo: 70,        // 自然回归的基准值（调高一点，默认偏暖）
   moodDriftRate: 0.05,    // 每条消息向基准回归的比例
   // 亲密度
   intimacyUpPerMsg: 1.2,  // 每聊一条
@@ -43,7 +44,7 @@ function fileOf(key) {
 function blank(key) {
   return {
     key,
-    mood: 60,
+    mood: 70,
     intimacy: 5,
     energy: 80,
     lastSeen: Date.now(),
@@ -154,11 +155,11 @@ export function applyDecay(rec, cfg) {
 /** 把数值翻译成给模型的自然语言指令 */
 export function render(rec) {
   const moodP = [
-    [80, '心情很好，话可以多一点，愿意主动搭话'],
-    [60, '心情不错，正常聊天'],
-    [40, '心情一般，有点懒得说话，回复偏短'],
-    [20, '心情不太好，有点烦，不想多聊，可能怼人'],
-    [0, '心情很差，很冷淡，回复极短甚至不想理人'],
+    [80, '心情很好，话可以多一点，愿意主动搭话、开玩笑'],
+    [60, '心情不错，语气轻松，愿意多聊两句'],
+    [40, '心情一般，懒得说太多，回复偏短，但别冷场'],
+    [20, '心情不太好，有点烦，不想多聊'],
+    [0, '心情很差，很冷淡，回复极短'],
   ];
   const intiP = [
     [80, '关系很熟，可以开玩笑、调侃、用亲昵的称呼'],
