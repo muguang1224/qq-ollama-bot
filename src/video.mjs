@@ -10,11 +10,10 @@
 // 注意这不是"理解视频"，而是"看几张截图"。要在 prompt 里说清楚。
 
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, readFileSync } from 'node:fs';
-import { join, dirname, extname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, extname } from 'node:path';
 import { execFile } from 'node:child_process';
+import { ROOT } from './paths.mjs';
 
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const WORK = join(ROOT, '.video-work');
 if (!existsSync(WORK)) mkdirSync(WORK, { recursive: true });
 

@@ -9,11 +9,9 @@
 // 做法是把数值翻译成自然语言指令拼进 system prompt。
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { ROOT } from './paths.mjs';
 
-// 数据存在项目根目录（src 的上一级），与代码分开
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const EMO_DIR = join(ROOT, 'emotions');
 if (!existsSync(EMO_DIR)) mkdirSync(EMO_DIR, { recursive: true });
 

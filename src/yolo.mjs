@@ -17,19 +17,14 @@
  */
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join, dirname, isAbsolute, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-// 本文件可能放在项目根目录（本地开发）或 src/ 下（发布版），
-// 两种情况都要能找到 yolo-models/，所以把两级目录都作为候选。
-const HERE = dirname(fileURLToPath(import.meta.url));
-const ROOTS = [HERE, dirname(HERE)];
+import { join, isAbsolute, resolve } from 'node:path';
+import { ROOT } from './paths.mjs';
 
 export const YOLO_DEFAULTS = {
   enabled: true,
   python: 'python',
-  script: '',          // 留空则自动找
-  modelDir: '',        // 留空则自动找 <root>/yolo-models
+  script: '',          // 留空则用 modelDir 下的 yolo.py
+  modelDir: '',        // 留空则用 <root>/yolo-models
   timeoutMs: 30000,
   confThres: 0.35,
 };
@@ -39,14 +34,11 @@ function scriptPath(cfg) {
   const c = { ...YOLO_DEFAULTS, ...(cfg?.yolo || {}) };
   if (c.script && existsSync(c.script)) return c.script;
 
-  // 依次找几个常见位置
-  const cands = [];
-  for (const r of ROOTS) {
-    cands.push(join(r, 'yolo-models', 'yolo.py'));
-    cands.push(join(r, 'yolo', 'yolo.py'));
-    cands.push(join(r, 'src', 'yolo', 'yolo.py'));
-  }
-  for (const p of cands) if (existsSync(p)) return p;
+  // yolo.py 统一放在项目根的 yolo-models/ 下
+  for (const p of [
+    join(ROOT, 'yolo-models', 'yolo.py'),
+    join(ROOT, 'yolo', 'yolo.py'),
+  ]) if (existsSync(p)) return p;
   return null;
 }
 
@@ -54,11 +46,8 @@ function scriptPath(cfg) {
 function modelDir(cfg) {
   const c = { ...YOLO_DEFAULTS, ...(cfg?.yolo || {}) };
   if (c.modelDir && existsSync(c.modelDir)) return c.modelDir;
-  for (const r of ROOTS) {
-    for (const name of ['yolo-models', 'yolo', 'models']) {
-      const d = join(r, name);
-      if (existsSync(join(d, 'yolo11n.onnx'))) return d;
-    }
+  for (const d of [join(ROOT, 'yolo-models'), join(ROOT, 'yolo'), join(ROOT, 'models')]) {
+    if (existsSync(join(d, 'yolo11n.onnx'))) return d;
   }
   return null;
 }

@@ -14,8 +14,8 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { ROOT } from './paths.mjs';
 import { PERSONA, DEFAULTS } from './persona.mjs';
 import * as Mem from './memory.mjs';
 import * as AutoFriend from './autofriend.mjs';
@@ -23,10 +23,6 @@ import * as Proactive from './proactive.mjs';
 import * as Emo from './emotion.mjs';
 import * as Stickers from './stickers.mjs';
 import * as Video from './video.mjs';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-// 项目根目录（src 的上一级）。config/日志/数据都放这里，让代码和用户数据分开。
-const ROOT = dirname(__dirname);
 
 // ---------------------------------------------------------------- 配置
 

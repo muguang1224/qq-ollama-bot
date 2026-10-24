@@ -257,6 +257,7 @@ qq-ollama-bot/
 ├── persona.example.mjs       ← 示例人设
 └── src/
     ├── bridge.mjs            ← 主程序
+    ├── paths.mjs             ← 项目根定位（所有模块统一用它）
     ├── memory.mjs            ← 长期记忆 + 人设进化
     ├── emotion.mjs           ← 情绪系统
     ├── stickers.mjs          ← 表情包收集 / 视觉识别 / GIF 解码 / 图片缩放
@@ -336,6 +337,26 @@ GIF 用内置解码器，JPEG 用 ffmpeg，PNG 用内置的纯 JS 缩放。
 
 另外 **cv2 读 GIF 不可靠** —— 实测会把动漫表情读坏、推理结果全错。
 代码里统一用 **Pillow 读图**（转 RGB、透明区贴白底），再交给 cv2 缩放。
+
+### 项目根目录怎么定位（paths.mjs）
+
+代码可能在两个位置：本地开发时在项目根，发布版在 `src/` 下。
+一开始每个模块各写一套定位（`dirname(__dirname)` / `dirname(dirname(...))` / 硬编码），
+结果接连出问题：
+
+- 配置文件被生成到 `src/config.json` 而不是项目根
+- `video.mjs` 多取一级，指到了桌面上
+- `检查NapCat.mjs` 硬编码了开发机的路径，换台机器就废
+
+现在统一用 `src/paths.mjs`：**从本文件往上找 `package.json`**，
+找不到就找带 `src/` 或 `yolo-models/` 的目录，再不行退一级。
+
+```js
+import { ROOT } from './paths.mjs';
+const MEM_DIR = join(ROOT, 'memories');
+```
+
+这样代码放哪都不会错，也不写死任何路径。有对应的单测覆盖了 5 种目录布局。
 
 ### 关于 GIF
 

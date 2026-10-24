@@ -14,11 +14,9 @@
 //   - 连续被冷落就拉长间隔
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { ROOT } from './paths.mjs';
 
-// 数据存在项目根目录（src 的上一级），与代码分开
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const STATE_DIR = join(ROOT, 'proactive');
 if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
 

@@ -3,11 +3,9 @@
 // 两者拼接后送进模型，避免聊久了人格漂移。
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { ROOT } from './paths.mjs';
 
-// 数据存在项目根目录（src 的上一级），与代码分开
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const MEM_DIR = join(ROOT, 'memories');
 
 if (!existsSync(MEM_DIR)) mkdirSync(MEM_DIR, { recursive: true });

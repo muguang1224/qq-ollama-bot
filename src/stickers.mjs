@@ -9,12 +9,10 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import zlib from 'node:zlib';
-import { join, dirname, extname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, extname } from 'node:path';
 import { createHash } from 'node:crypto';
+import { ROOT } from './paths.mjs';
 
-// 数据存在项目根目录（src 的上一级），与代码分开
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const STICKER_DIR = join(ROOT, 'stickers');
 export const INDEX_FILE = join(STICKER_DIR, 'index.json');
 export const SEEN_FILE = join(STICKER_DIR, '.seen.json');

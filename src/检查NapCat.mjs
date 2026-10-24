@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
  * NapCat 状态检查
- * 用法: node src/检查NapCat.mjs [NapCat所在目录]
+ * 用法: node 检查NapCat.mjs [NapCat所在目录]
  *
  * 不写死路径：不给参数时自动在常见位置找。
  */
 import { readdirSync, existsSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { ROOT } from './paths.mjs';
 
 const OK = (s) => '  ✅ ' + s;
 const NO = (s) => '  ❌ ' + s;
@@ -17,8 +17,7 @@ const NO = (s) => '  ❌ ' + s;
 function findNapCat() {
   if (process.argv[2]) return process.argv[2];
 
-  const root = dirname(dirname(fileURLToPath(import.meta.url)));
-  const dirs = [root, join(root, '..'), join(homedir(), 'Desktop'), join(homedir(), 'Downloads'), process.cwd()];
+  const dirs = [ROOT, dirname(ROOT), join(homedir(), 'Desktop'), join(homedir(), 'Downloads'), process.cwd()];
 
   for (const d of dirs) {
     if (!existsSync(d)) continue;
@@ -29,7 +28,7 @@ function findNapCat() {
       const p = join(d, e);
       // 可能就是 Shell 目录
       if (existsSync(join(p, 'versions'))) return p;
-      // 或者里面还有一层
+      // 或者里面还有一层（如 NapCat.Shell.Windows.OneKey/NapCat.xxx.Shell）
       try {
         for (const sub of readdirSync(p)) {
           const sp = join(p, sub);
@@ -50,7 +49,7 @@ console.log('='.repeat(62));
 
 if (!shell) {
   console.log('\n' + NO('没找到 NapCat'));
-  console.log('  可以手动指定:  node src/检查NapCat.mjs "你的 NapCat 目录"');
+  console.log('  可以手动指定:  node 检查NapCat.mjs "你的 NapCat 目录"');
   console.log('  下载: https://github.com/NapNeko/NapCatQQ/releases');
   process.exit(1);
 }

@@ -8,10 +8,9 @@
  */
 import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
+import { ROOT } from './paths.mjs';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
 const cfg = JSON.parse(readFileSync(join(ROOT, 'config.json'), 'utf8'));
 const { PERSONA } = await import('./persona.mjs');
 

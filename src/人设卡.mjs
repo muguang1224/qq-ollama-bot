@@ -7,9 +7,13 @@ import { readFileSync, writeFileSync, copyFileSync, existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ROOT } from './paths.mjs';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const FILE = join(ROOT, 'persona.mjs');
+// persona.mjs 和 bridge.mjs 同目录（本地在根、发布版在 src/）
+const HERE = dirname(fileURLToPath(import.meta.url));
+const FILE = existsSync(join(HERE, 'persona.mjs'))
+  ? join(HERE, 'persona.mjs')
+  : join(ROOT, 'persona.mjs');
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 const ask = (q) => new Promise((r) => rl.question(q, r));
