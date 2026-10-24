@@ -11,9 +11,10 @@
  *
  * 不写死任何路径，任何人 clone 下来都能跑。
  */
-import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execSync, execFileSync } from 'node:child_process';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const CHAT_MODEL = 'qwen3.5-4b';
@@ -68,8 +69,6 @@ if (ollamaOk) {
     have = (( await r.json()).models || []).map((m) => m.name);
   } catch {}
 
-  const { execSync } = await import('node:child_process');
-
   for (const m of [CHAT_MODEL, VISION_MODEL]) {
     const base = m.split(':')[0];
     const already = have.some((n) => n === m || n.startsWith(base + ':'));
@@ -89,8 +88,92 @@ if (ollamaOk) {
   console.log('    ollama pull ' + VISION_MODEL);
 }
 
-// ---------------------------------------------------------------- 4. 配置
-console.log(STEP(4, '生成配置'));
+// ---------------------------------------------------------------- 4. YOLO（可选）
+console.log(STEP(4, 'YOLO 目标检测（可选增强）'));
+console.log('  三个 ONNX 模型共约 32MB，用 ONNX Runtime 跑，不需要 PyTorch。');
+console.log('  对卡通表情识别不准（实测会把动漫角色认成"时钟"），只作为参考信息。');
+console.log();
+
+const yoloDir = join(ROOT, 'yolo-models');
+if (!existsSync(yoloDir)) mkdirSync(yoloDir, { recursive: true });
+
+const YOLO_FILES = [
+  { name: 'yolo11n.onnx', id: 327949165, size: 10930182 },
+  { name: 'yolo11n-pose.onnx', id: 329009385, size: 11853451 },
+  { name: 'yolo11n-cls.onnx', id: 329009500, size: 11293091 },
+];
+
+let pyOk = false;
+let pyWhy = '';
+{
+  // 分步检测，避免 shell 引号问题。
+  // 之前一行 import 三个包会误判（实测：手动能跑，脚本里却报失败）。
+  const tries = [
+    ['python', ['-c', 'import sys; print(sys.version_info[0])']],
+    ['py', ['-c', 'import sys; print(sys.version_info[0])']],
+  ];
+  let pyCmd = null;
+  for (const [cmd, args] of tries) {
+    try {
+      const v = execFileSync(cmd, args, { timeout: 15000, encoding: 'utf8' }).trim();
+      if (Number(v) >= 3) { pyCmd = cmd; break; }
+    } catch { /* 试下一个 */ }
+  }
+
+  if (!pyCmd) {
+    pyWhy = '没找到 python（试过 python / py）';
+  } else {
+    try {
+      execFileSync(pyCmd, ['-c', 'import onnxruntime, cv2, numpy'], { timeout: 30000, stdio: 'ignore' });
+      pyOk = true;
+    } catch {
+      pyWhy = '缺依赖包（需要 onnxruntime、opencv-python-headless、numpy）';
+    }
+  }
+}
+
+if (!pyOk) {
+  console.log(WA('YOLO 跳过：' + pyWhy));
+  console.log('    装一下依赖再重跑本脚本: pip install onnxruntime opencv-python-headless numpy');
+  console.log('    不装也不影响其他功能。');
+} else {
+  console.log(OK('Python 环境就绪（onnxruntime + opencv）'));
+  for (const f of YOLO_FILES) {
+    const p = join(yoloDir, f.name);
+    if (existsSync(p) && statSync(p).size === f.size) {
+      console.log(OK(f.name + ' 已存在'));
+      continue;
+    }
+    console.log('  下载 ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + 'MB) ...');
+    try {
+      // 用 GitHub API 的 octet-stream 端点拿签名直链。
+      // 为什么不直接下 release 链接：部分网络下 github.com 直连不通，
+      // 而 api.github.com 通常通。
+      const api = 'https://api.github.com/repos/ultralytics/assets/releases/assets/' + f.id;
+      const res = await fetch(api, {
+        headers: { Accept: 'application/octet-stream', 'User-Agent': 'qq-ollama-bot' },
+        redirect: 'follow',
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length !== f.size) {
+        console.log(WA(f.name + ' 大小不对（' + buf.length + '/' + f.size + '），跳过'));
+        continue;
+      }
+      writeFileSync(p, buf);
+      console.log(OK(f.name + ' 完成'));
+    } catch (e) {
+      console.log(WA(f.name + ' 下载失败: ' + String(e.message).slice(0, 60)));
+      console.log('    YOLO 会自己跳过，不影响其他功能。');
+      console.log('    想手动补：去 https://github.com/ultralytics/assets/releases/tag/v8.3.0');
+      console.log('    下 ' + f.name + ' 放进 yolo-models/');
+    }
+  }
+}
+
+// ---------------------------------------------------------------- 5. 配置
+console.log(STEP(5, '生成配置'));
 
 // 数据目录
 for (const d of ['memories', 'emotions', 'stickers', 'proactive', 'logs']) {
@@ -153,8 +236,24 @@ if (existsSync(cfgPath)) {
       enabled: true, chance: 0.25, cooldownMin: 20,
     },
     vision: {
-      _说明: '用视觉模型"看"图片。',
-      enabled: true, model: VISION_MODEL, batch: 3, gapMs: 5000,
+      _说明: '用视觉模型"看"图片。maxPx 是送模型前缩到的最大边 —— 实测 256 是速度/质量最佳点，调大会慢很多倍。',
+      enabled: true, model: VISION_MODEL, maxPx: 256, batch: 3, gapMs: 5000,
+    },
+    video: {
+      _说明: '视频抽帧识别。不是真的理解视频，只是看几张截图。',
+      enabled: true, frames: 3, width: 256, maxMB: 80,
+    },
+    audio: {
+      _说明: '语音转文字（用 QQ 自带能力）。',
+      enabled: true,
+    },
+    yolo: {
+      _说明: 'YOLO 目标检测（ONNX CPU）。和大模型独立跑，结果都存。对卡通表情不准，只作参考。',
+      enabled: true, python: 'python', timeoutMs: 30000,
+    },
+    followUp: {
+      _说明: '会话内追问：回复后有时再补一句，避免一问一答就结束。',
+      enabled: true, chance: 0.3,
     },
   };
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');

@@ -7,6 +7,7 @@
 //   - AI 标签只作为辅助（可选），不作为主要依据
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import zlib from 'node:zlib';
 import { join, dirname, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,6 +71,14 @@ export async function describe(filePath, cfg, timeoutMs = 90000) {
     else imgBuf = raw;
     if (!imgBuf) throw new Error('无法识别的图片格式');
   }
+
+  // —— 关键：把图缩到 256px 再送模型 ——
+  //
+  // 实测（Ollama 0.24.0 + qwen2.5vl:3b）：
+  //   原图（148KB JPEG）直接送 → 46~200 秒，甚至 "Failed to create new sequence"
+  //   缩到 256px（18KB）        → 4.4 秒，稳定成功
+  //   64px 更快（1.5s）但细节丢失，256px 是速度和质量的最佳点
+  imgBuf = shrinkForVision(imgBuf, cfg?.vision?.maxPx || 256);
 
   const b64 = imgBuf.toString('base64');
 
@@ -285,6 +294,34 @@ export function setDescription(id, { visual, emotion }) {
   return true;
 }
 
+/**
+ * 存 YOLO 的客观检测结果。
+ *
+ * 为什么要单独存：YOLO 和大模型是两条独立证据 ——
+ *   YOLO 给事实（几个人、什么物体）
+ *   大模型给语义（画的是什么、什么情绪）
+ * 两者结果都存，选图和展示时可以互相补充。
+ *
+ * ⚠️ 局限（实测）：YOLO 对卡通/表情包基本无效，会把动漫角色
+ * 误判成"时钟"。所以这里的结论只作参考，不能当真相。
+ */
+export function setYolo(id, yolo, note) {
+  const idx = loadIndex();
+  const it = idx.items.find((x) => x.id === id);
+  if (!it) return false;
+  it.yolo = {
+    persons: yolo?.pose?.persons ?? null,
+    objects: (yolo?.detect?.objects || []).slice(0, 6).map((o) => ({
+      n: o.nameCn || o.name,
+      c: o.conf,
+    })),
+    note: String(note || '').slice(0, 120),
+    at: new Date().toISOString(),
+  };
+  saveIndex(idx);
+  return true;
+}
+
 /** 英文情绪 → 中文关键词（用于和中文对话匹配） */
 function translateEmotion(e) {
   const s = String(e || '').toLowerCase();
@@ -426,6 +463,139 @@ function guessExt(buf, meta) {
   return '.jpg';
 }
 
+/**
+ * 把图片缩到指定宽度，减少视觉模型的负担。
+ *
+ * 为什么必须做（实测数据）：
+ *   原图 148KB JPEG → 46~200s，有时直接 "Failed to create new sequence"
+ *   缩到 256px/18KB → 4.4s，稳定
+ *
+ * 实现：JPEG 用内置的最近缩放（只降采样，够用）；
+ *      PNG 先解出像素再缩放。因为是给 AI 看的，不需要高质量插值。
+ */
+function shrinkForVision(buf, maxPx) {
+  const fmt = sniffFormat(buf);
+  try {
+    if (fmt === 'jpg') return shrinkJpegByReencode(buf, maxPx);
+    if (fmt === 'png') return shrinkPng(buf, maxPx);
+  } catch {
+    return buf;   // 缩不了就用原图
+  }
+  return buf;
+}
+
+/** PNG 缩放：解出 RGBA → 最近邻缩放 → 重新编码 */
+function shrinkPng(buf, maxPx) {
+  // 只处理简单的 8 位真彩 PNG；其它情况原样返回
+  const info = parsePng(buf);
+  if (!info) return buf;
+  const { W, H, rgba } = info;
+  if (Math.max(W, H) <= maxPx) return buf;
+
+  const scale = maxPx / Math.max(W, H);
+  const nw = Math.max(1, Math.round(W * scale));
+  const nh = Math.max(1, Math.round(H * scale));
+  const out = Buffer.alloc(nw * nh * 4);
+
+  for (let y = 0; y < nh; y++) {
+    const sy = Math.min(H - 1, Math.floor(y / scale));
+    for (let x = 0; x < nw; x++) {
+      const sx = Math.min(W - 1, Math.floor(x / scale));
+      const s = (sy * W + sx) * 4, d = (y * nw + x) * 4;
+      out[d] = rgba[s]; out[d + 1] = rgba[s + 1];
+      out[d + 2] = rgba[s + 2]; out[d + 3] = rgba[s + 3];
+    }
+  }
+  return rgbaToPng(nw, nh, out);
+}
+
+/** 极简 PNG 解析（8 位 RGBA/RGB，非隔行） */
+function parsePng(buf) {
+  if (buf.length < 33) return null;
+  if (buf.readUInt32BE(0) !== 0x89504e47) return null;
+  const W = buf.readUInt32BE(16), H = buf.readUInt32BE(20);
+  const depth = buf[24], colorType = buf[25], interlace = buf[28];
+  if (depth !== 8 || interlace !== 0) return null;
+  if (colorType !== 6 && colorType !== 2) return null;   // 只支持 RGBA/RGB
+
+  const bpp = colorType === 6 ? 4 : 3;
+  // 收集 IDAT
+  let p = 8, idat = [];
+  while (p + 8 <= buf.length) {
+    const len = buf.readUInt32BE(p);
+    const type = buf.slice(p + 4, p + 8).toString('ascii');
+    if (type === 'IDAT') idat.push(buf.slice(p + 8, p + 8 + len));
+    if (type === 'IEND') break;
+    p += 12 + len;
+  }
+  if (!idat.length) return null;
+
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = W * bpp;
+  const rgba = Buffer.alloc(W * H * 4, 255);
+  let prev = Buffer.alloc(stride);
+
+  for (let y = 0; y < H; y++) {
+    const ft = raw[y * (stride + 1)];
+    const line = raw.slice(y * (stride + 1) + 1, y * (stride + 1) + 1 + stride);
+    const cur = Buffer.alloc(stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0;
+      const b = prev[i];
+      const c = i >= bpp ? prev[i - bpp] : 0;
+      let v = line[i];
+      if (ft === 1) v += a;
+      else if (ft === 2) v += b;
+      else if (ft === 3) v += (a + b) >> 1;
+      else if (ft === 4) {
+        const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c);
+        v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+      }
+      cur[i] = v & 0xff;
+    }
+    for (let x = 0; x < W; x++) {
+      const s = x * bpp, d = (y * W + x) * 4;
+      rgba[d] = cur[s]; rgba[d + 1] = cur[s + 1]; rgba[d + 2] = cur[s + 2];
+      rgba[d + 3] = bpp === 4 ? cur[s + 3] : 255;
+    }
+    prev = cur;
+  }
+  return { W, H, rgba };
+}
+
+/**
+ * JPEG 缩放。
+ *
+ * 纯 JS 写 JPEG 解码器太重（要处理霍夫曼表、DCT、色度子采样），
+ * 所以用系统 ffmpeg —— 它本来就在（视频抽帧也用）。
+ * 没有 ffmpeg 就返回原图，靠超时保护兜底。
+ *
+ * 实测：这一步把 148KB 的 JPEG 变成 18KB 的 256px 图，
+ * 视觉模型从 46~200 秒降到 4.4 秒。
+ */
+function shrinkJpegByReencode(buf, maxPx) {
+  const ff = process.env.FFMPEG_PATH || 'ffmpeg';
+  const tmpIn = join(STICKER_DIR, '.sz_' + Date.now() + '_in.jpg');
+  const tmpOut = join(STICKER_DIR, '.sz_' + Date.now() + '_out.jpg');
+  try {
+    writeFileSync(tmpIn, buf);
+    // 同步调用，简单直接（这一步通常只要几十毫秒）
+    execFileSync(ff, ['-y', '-v', 'error', '-i', tmpIn,
+      '-vf', 'scale=' + maxPx + ':-1', '-q:v', '5', tmpOut],
+      { timeout: 15000, windowsHide: true, stdio: 'ignore' });
+    if (existsSync(tmpOut)) {
+      const out = readFileSync(tmpOut);
+      if (out.length > 100) return out;
+    }
+  } catch {
+    // ffmpeg 不在或失败 → 用原图
+  } finally {
+    try { if (existsSync(tmpIn)) rmFile(tmpIn); } catch {}
+    try { if (existsSync(tmpOut)) rmFile(tmpOut); } catch {}
+  }
+  return buf;
+}
+
 /** 读魔数判断真实格式（给 describe 用） */
 function sniffFormat(buf) {
   if (!buf || buf.length < 8) return 'unknown';
@@ -461,8 +631,12 @@ export function stats() {
  *   1. 场景文本命中（对方的话曾和这张图一起出现）
  *   2. 情绪关键词命中（AI 描述的情绪 vs 当前对话）
  *   3. 都没有 → 挑最久没发的
+ *
+ * YOLO 只在最后做【轻微加权】，不做主导判断：
+ *   实测它对卡通表情不准（把动漫角色认成"时钟"），
+ *   只有"人形数量"这一项相对可靠，所以只用它做个软偏好。
  */
-export function pick({ context = '', exclude = [], random = Math.random, moodHint = '' } = {}) {
+export function pick({ context = '', exclude = [], random = Math.random, moodHint = '', preferPerson = null } = {}) {
   const idx = loadIndex();
   if (!idx.items.length) return null;
 
@@ -487,6 +661,20 @@ export function pick({ context = '', exclude = [], random = Math.random, moodHin
 
   // 挑最久没发的，前几个里随机
   pool.sort((a, b) => (a.lastSent || 0) - (b.lastSent || 0));
+
+  // —— YOLO 软加权（只在这里用，且权重很低）——
+  // 实测 YOLO 只对"有没有人形"相对可靠，所以仅当调用方明确要求
+  // preferPerson 时才用它微调顺序，不改变候选池。
+  if (preferPerson === true || preferPerson === false) {
+    const want = preferPerson ? 1 : 0;
+    pool = pool.slice().sort((a, b) => {
+      const sa = (a.yolo?.persons > 0 ? 1 : 0) === want ? 0 : 1;
+      const sb = (b.yolo?.persons > 0 ? 1 : 0) === want ? 0 : 1;
+      if (sa !== sb) return sa - sb;              // 先按是否符合偏好
+      return (a.lastSent || 0) - (b.lastSent || 0); // 再按最久没发
+    });
+  }
+
   const top = pool.slice(0, Math.min(5, pool.length));
   return top[Math.floor(random() * top.length)];
 }
@@ -573,12 +761,39 @@ export async function labelPending(cfg, log, opt = {}) {
   const todo = pendingDescription().slice(0, max);
   if (!todo.length) return { done: 0, pending: 0 };
 
+  // YOLO 是可选增强。它是 Python 脚本，通过 execFile 调用。
+  // 动态 import 避免在没装 YOLO 的环境里报错。
+  let Yolo = null;
+  if (cfg?.yolo?.enabled !== false) {
+    try { Yolo = await import('./yolo.mjs'); } catch { Yolo = null; }
+    if (Yolo && !Yolo.available(cfg)) Yolo = null;
+  }
+
   labeling = true;
   let ok = 0;
   try {
     for (const it of todo) {
       const p = join(STICKER_DIR, it.file);
       if (!existsSync(p)) continue;
+
+      // —— 先跑 YOLO：快（几百毫秒），给客观事实 ——
+      if (Yolo) {
+        try {
+          const y = await Yolo.analyze(p, cfg, 'all');
+          if (y?.ok) {
+            const note = Yolo.render(y);
+            setYolo(it.id, y, note);
+            if (log) log('  🔍 YOLO: ' + it.file.slice(0, 20) + ' → ' + (note || '无检出') +
+              '  (' + y.ms + 'ms)');
+          } else if (log) {
+            log('  🔍 YOLO 失败: ' + String(y?.error || '').slice(0, 50));
+          }
+        } catch (e) {
+          if (log) log('  🔍 YOLO 异常: ' + e.message.slice(0, 60));
+        }
+      }
+
+      // —— 再跑大模型：慢，给语义理解 ——
       try {
         const d = await describe(p, cfg);
         setDescription(it.id, d);
@@ -588,6 +803,7 @@ export async function labelPending(cfg, log, opt = {}) {
       } catch (e) {
         if (log) log('  👁 标注失败(' + it.file.slice(0, 16) + '): ' + e.message);
       }
+
       await new Promise((r) => setTimeout(r, gap));
     }
   } finally {

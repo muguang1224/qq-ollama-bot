@@ -7,8 +7,11 @@ config.json
 config.*.json
 !config.example.json
 
-# 你的人设（可能含个人信息）
+# 你的人设（可能含个人信息）—— 安装时从 persona.example.mjs 生成
+src/persona.mjs
 persona.mjs
+!src/persona.example.mjs
+!persona.example.mjs
 
 # 运行数据（含聊天记录、QQ 号）
 memories/
@@ -17,8 +20,16 @@ proactive/
 stickers/
 logs/
 
+# 视频抽帧临时目录
+.video-work/
+
 # 备份
 *.bak
+
+# ============================================================
+#  YOLO 模型文件（32MB 二进制，用 install 脚本下载）
+# ============================================================
+*.onnx
 
 # ============================================================
 #  NapCat / QQ 相关（体积大且含登录态）
