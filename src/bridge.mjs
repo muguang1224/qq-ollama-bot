@@ -1158,6 +1158,9 @@ function startProactive(bot, cfg) {
 
 // ---------------------------------------------------------------- QQ 空间
 
+/** QQ空间的运行时句柄（startQzone 里填充），供消息处理里的「按需发布」使用 */
+const qzoneRuntime = { ready: false, chat: null, getCred: null };
+
 function startQzone(bot, cfg) {
   const q = cfg.qzone || {};
   if (!q.enabled) {
@@ -1207,6 +1210,11 @@ function startQzone(bot, cfg) {
       log('QQ空间出错：' + e.message);
     }
   };
+
+  // 把句柄暴露出去，消息处理里「按需发布」要用
+  qzoneRuntime.ready = true;
+  qzoneRuntime.chat = chat;
+  qzoneRuntime.getCred = getCred;
 
   // 首次延迟 3 分钟（等桥接稳定），之后按配置间隔检查
   const everyMs = (q.checkEveryMin || 60) * 60000;
@@ -1505,6 +1513,44 @@ async function main() {
           return;
         }
       }
+    }
+
+    // —— 按需发空间 ——
+    // 用户说「发个空间」「帮我发条说说」时，真的发一条（不是只答应）。
+    // 放在冷却之后，避免和普通回复抢。
+    if (Qzone.isPublishRequest(text)) {
+      lastReplyAt.set(key, Date.now());   // 占一次冷却，避免紧接着又回一条
+      const who0 = ev.sender?.card || ev.sender?.nickname || ev.user_id;
+      log('收到 [' + (ev.message_type === 'group' ? '群' + ev.group_id : '私聊') + '] ' + who0 +
+          ' 要求发空间: ' + text);
+
+      if (!qzoneRuntime.ready) {
+        const msg = '我这边空间功能没开着呀';
+        if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, msg);
+        else await bot.sendPrivate(ev.user_id, msg);
+        return;
+      }
+
+      let reply;
+      try {
+        const r = await Qzone.publishOnDemand({
+          chat: qzoneRuntime.chat,
+          cfg,
+          log,
+          getCred: qzoneRuntime.getCred,
+          request: Qzone.extractRequest(text),
+        });
+        reply = r.reply;
+      } catch (e) {
+        log('  按需发空间出错: ' + e.message);
+        reply = '刚才发的时候出了点问题呀，等会儿再试试';
+      }
+
+      remember(key, 'assistant', reply, cfg.reply.contextTurns);
+      if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, reply);
+      else await bot.sendPrivate(ev.user_id, reply);
+      log('  回复: ' + reply);
+      return;
     }
 
     // 管理命令
