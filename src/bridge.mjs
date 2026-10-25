@@ -243,8 +243,16 @@ async function ollamaChat(messages, cfg) {
   }
 }
 
-/** 清理模型输出：去掉 markdown、多余换行、可能的自我暴露 */
-function sanitize(text) {
+/**
+ * 清理模型输出：去掉 markdown、多余换行、可能的自我暴露
+ *
+ * @param {string} text
+ * @param {object} [ctx] 上下文，用于「不该叫的称呼」拦截
+ *        ctx.isOwner  — 当前说话人是不是主人
+ *        ctx.ownerName — 主人的称呼（默认「爸爸」）
+ *        ctx.isGroup  — 是不是群聊
+ */
+function sanitize(text, ctx) {
   let t = text;
   t = t.replace(/\*\*([^*]*)\*\*/g, '$1');       // **粗体**
   t = t.replace(/^#{1,6}\s*/gm, '');              // # 标题
@@ -275,6 +283,30 @@ function sanitize(text) {
   if (fake) {
     log('  ⚠️ 检测到编造外部经历，已替换：' + t.slice(0, 40));
     return '我一直在待着呀 没别的事呢';
+  }
+
+  // —— 称呼兜底：不是主人就不许用主人的称呼 ——
+  // 群里出现过「对谁都叫爸」的问题（主人判定在群聊里失效）。
+  // 这里做代码层兜底，把亲属称呼统一换成中性的「你」。
+  //
+  // 实现说明：一开始用了带 lookahead 的正则，但「爸你…」这种最常见的
+  // 组合（称呼后直接跟「你」）反而匹配不到，所以改成直接字符串替换，
+  // 更笨但更可靠。按长度从长到短替换，避免「爸爸」被「爸」先吃掉。
+  if (ctx && !ctx.isOwner) {
+    const words = [ctx.ownerName || '爸爸', '爸爸', '老爸', '爸', '爹', '爹爹'];
+    const before = t;
+    for (const w of [...new Set(words)].sort((a, b) => b.length - a.length)) {
+      if (!w) continue;
+      t = t.split(w).join('你');
+    }
+    // 收敛替换后的瑕疵：
+    //  · 「你你」重复
+    //  · 「你，你…」这种称呼后残留的标点（原来是「爸，你…」）
+    t = t.replace(/你{2,}/g, '你');
+    t = t.replace(/你[，,]\s*你/g, '你');
+    if (t !== before) {
+      log('  ⚠️ 非主人场景出现主人称呼，已改为「你」：' + before.slice(0, 40));
+    }
   }
 
   return t.trim();
@@ -313,11 +345,15 @@ function detectFakeExperience(text) {
  * 把人物档案渲染成 system prompt 片段。
  * 统一入口：把「主人」配置（cfg.bot.owner / ownerName）一并传下去，
  * 这样 memory.mjs 不需要硬编码任何 QQ 号，公开仓库里也不会泄漏个人信息。
+ *
+ * speakerQQ：当前发消息的人。群聊里 rec.key 是 g:群号，光看 key
+ * 无法判断说话的是谁，主人判定会失效（表现为对谁都叫"爸"）。
  */
-function renderMemory(rec, cfg) {
+function renderMemory(rec, cfg, speakerQQ) {
   return Mem.render(rec, cfg.bot?.name, {
     ownerQQ: cfg.bot?.owner || 0,
     ownerName: cfg.bot?.ownerName || '主人',
+    speakerQQ: speakerQQ || 0,
   });
 }
 
@@ -1044,7 +1080,7 @@ function startProactive(bot, cfg) {
       if (cfg.proactive.thinkBeforeSend) {
         const d = await Proactive.thinkWhetherToSpeak({
           persona: PERSONA,
-          about: renderMemory(rec, cfg),
+          about: renderMemory(rec, cfg, target),
           recent: hist,
           now: new Date(),
         }, cfg);
@@ -1052,15 +1088,23 @@ function startProactive(bot, cfg) {
           log('💭 主动聊天：决定不说（' + d.reason + '）');
           return;
         }
-        message = sanitize(d.message);
+        message = sanitize(d.message, {
+          isOwner: !!cfg.bot?.owner && String(target) === String(cfg.bot.owner),
+          ownerName: cfg.bot?.ownerName || '爸爸',
+          isGroup: false,
+        });
         reason = d.reason;
       } else {
         // 不走思考：直接让模型基于记忆生成一句
         const msgs = [
-          { role: 'system', content: PERSONA + renderMemory(rec, cfg) },
+          { role: 'system', content: PERSONA + renderMemory(rec, cfg, target) },
           { role: 'user', content: '（现在没人跟你说话。你主动开个话题，说一句简短自然的话。只输出要发的内容。）' },
         ];
-        message = sanitize(await ollamaChat(msgs, cfg));
+        message = sanitize(await ollamaChat(msgs, cfg), {
+          isOwner: !!cfg.bot?.owner && String(target) === String(cfg.bot.owner),
+          ownerName: cfg.bot?.ownerName || '爸爸',
+          isGroup: false,
+        });
         reason = '直接生成';
       }
 
@@ -1483,7 +1527,7 @@ async function main() {
       const rec = Mem.load(key);
       // 情绪状态也拼进去 —— 让数值真的影响说话
       const emoRec = Emo.load(key);
-      const systemPrompt = PERSONA + renderMemory(rec, cfg) +
+      const systemPrompt = PERSONA + renderMemory(rec, cfg, ev.user_id) +
         (cfg.emotion?.enabled !== false ? Emo.render(emoRec) : '');
 
       // 取上下文：不包括"刚存进去的这条"（下面会单独作为 user 消息传入）
@@ -1515,7 +1559,11 @@ async function main() {
         { role: 'user', content: text },
       ];
       const raw = await ollamaChat(msgs, cfg);
-      const reply = sanitize(raw);
+      const reply = sanitize(raw, {
+        isOwner: !!cfg.bot?.owner && String(ev.user_id) === String(cfg.bot.owner),
+        ownerName: cfg.bot?.ownerName || '爸爸',
+        isGroup: ev.message_type === 'group',
+      });
       if (!reply) return void log('  模型输出为空，跳过');
 
       remember(key, 'assistant', reply, cfg.reply.contextTurns);

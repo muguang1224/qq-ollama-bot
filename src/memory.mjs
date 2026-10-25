@@ -150,14 +150,29 @@ export function forget(key) {
 export function render(rec, botName, opts = {}) {
   const parts = [];
 
-  // —— 主人身份：优先于一切，且不受「人设进化」覆盖 ——
-  // 进化会把 knownAs 改成它自己学到的叫法，这里强制纠回配置的称呼。
-  // owner 配置来自 config.json 的 bot.owner（见 bridge.mjs），这里不硬编码任何 QQ 号。
+  // —— 主人身份判定 ——
+  // 两种场景都要能判断：
+  //   私聊：rec.key = 'p:<对方QQ>'，直接比 key
+  //   群聊：rec.key = 'g:<群号>'，比不了；改用 bridge 传进来的 speakerQQ
+  // 之前只判断了私聊，导致群聊里主人身份失效 —— 表现是对谁都叫"爸"。
   const ownerQQ = opts.ownerQQ ? String(opts.ownerQQ) : '';
   const ownerName = opts.ownerName || '主人';
-  const isOwner = ownerQQ && rec.key === 'p:' + ownerQQ;
+  const speakerQQ = opts.speakerQQ ? String(opts.speakerQQ) : '';
+  const isPrivate = String(rec.key || '').startsWith('p:');
+  const isGroup = String(rec.key || '').startsWith('g:');
+
+  const isOwner = !!ownerQQ && (
+    (isPrivate && rec.key === 'p:' + ownerQQ) ||
+    (isGroup && speakerQQ && speakerQQ === ownerQQ)
+  );
+
   if (isOwner) {
-    parts.push('【这个人是你主人，QQ ' + ownerQQ + '】你叫他「' + ownerName + '」。这是固定称呼，别改成别的。');
+    parts.push('【这个人是你主人，QQ ' + ownerQQ + '】你叫他「' + ownerName +
+               '」。这是固定称呼，别改成别的（也别对别人用）。');
+  } else if (isGroup && speakerQQ) {
+    // 群聊里不是主人的情况：明确告诉它这是谁，且不许乱用主人的称呼
+    parts.push('【现在是群聊，正在说话的人是 QQ ' + speakerQQ + '，**不是**你主人】' +
+               '不要叫他「' + ownerName + '」或任何亲属称呼，正常用「你」就行。');
   }
 
   if (rec.knownAs && !isOwner) parts.push('你叫对方「' + rec.knownAs + '」。');
