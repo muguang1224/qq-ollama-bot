@@ -23,6 +23,9 @@ logs/
 # 视频抽帧临时目录
 .video-work/
 
+# 单实例锁（运行时生成，含本机 pid）
+.bridge.lock
+
 # 备份
 *.bak
 

@@ -19,7 +19,7 @@
  *   node bridge.mjs --config a.json # 指定配置
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, statSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, statSync, rmSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROOT } from './paths.mjs';
 import { fileUrl, platformLabel, IS_WINDOWS } from './platform.mjs';
@@ -1124,8 +1124,69 @@ const lastReplyAt = new Map();
  * 已处理过的消息 id（去重用）。
  * OneBot 正常不会重复推送，但适配器重连、多个后端同时在线时可能重复，
  * 表现就是同一句话被回两遍。用 message_id 兜一层。
+ *
+ * 注意：这个 Set 只在【本进程内】有效。如果同时跑了两个 bridge，
+ * 它们各有各的 Set，去重就不起作用了 —— 那种情况由下面的
+ * 单实例锁（acquireSingleInstanceLock）在启动阶段直接拦住。
  */
 const seenMessageIds = new Set();
+
+// ---------------------------------------------------------------- 单实例锁
+//
+// 为什么需要：曾出现过 3 个 bridge 同时连 3001，结果同一条消息被回 3 次，
+// 而且每条的措辞还不一样（各自独立调模型），看起来就像机器人在胡言乱语。
+//
+// 做法：启动时独占创建一个锁文件，写入自己的 pid。
+//   · 创建成功 -> 说明没有别的实例，继续启动
+//   · 创建失败 -> 读锁文件里的 pid
+//       - 该进程还活着  -> 拒绝启动（真的重复了）
+//       - 该进程已不存在 -> 说明是上次崩溃留下的僵尸锁，抢占重写
+//
+// 进程正常退出时会删掉锁文件；被强杀（Stop-Process -Force）则删不掉，
+// 所以必须有上面「检查 pid 是否还活着」的兜底，否则一次强杀就再也起不来了。
+const LOCK_FILE = join(ROOT, '.bridge.lock');
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);   // 信号 0：只探测存在性，不真的发信号
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';   // 存在但没权限 -> 也算活着
+  }
+}
+
+/**
+ * 尝试取得单实例锁
+ * @returns {{ok:boolean, otherPid?:number}}
+ */
+export function acquireSingleInstanceLock() {
+  try {
+    if (existsSync(LOCK_FILE)) {
+      const raw = readFileSync(LOCK_FILE, 'utf8').trim();
+      const otherPid = parseInt(raw, 10);
+      if (Number.isFinite(otherPid) && otherPid !== process.pid && isPidAlive(otherPid)) {
+        return { ok: false, otherPid };
+      }
+      // 僵尸锁：进程没了，抢占
+      log('发现残留锁（pid ' + raw + ' 已不存在），接管。');
+    }
+    writeFileSync(LOCK_FILE, String(process.pid));
+    return { ok: true };
+  } catch (e) {
+    // 锁文件不可写等异常：不让它挡住启动，只提醒
+    log('⚠️ 单实例锁异常（继续启动）: ' + e.message);
+    return { ok: true };
+  }
+}
+
+/** 释放锁（只在还是自己的时候删） */
+export function releaseSingleInstanceLock() {
+  try {
+    if (!existsSync(LOCK_FILE)) return;
+    const raw = readFileSync(LOCK_FILE, 'utf8').trim();
+    if (String(process.pid) === raw) unlinkSync(LOCK_FILE);
+  } catch {}
+}
 
 /**
  * 主动聊天调度器。
@@ -1546,6 +1607,31 @@ const DRY = process.argv.includes('--dry-run');
 async function main() {
   const cfg = loadConfig();
   const bot = new OneBot(cfg);
+
+  // —— 单实例锁 ——
+  // 必须在连接 OneBot 之前挡住重复实例，否则两个进程都连上去，
+  // 同一条消息会被回复两次（各自独立生成，措辞还不一样）。
+  // dry-run 不需要锁（它不连 OneBot）。
+  if (!DRY) {
+    const lock = acquireSingleInstanceLock();
+    if (!lock.ok) {
+      log('='.repeat(56));
+      log('❌ 已经有一个机器人在运行（PID ' + lock.otherPid + '），不再启动第二个。');
+      log('');
+      log('   两个机器人同时连同一个 QQ，会把每条消息回复两遍。');
+      log('');
+      log('   想重启的话：');
+      log('     1. 先关掉正在运行的那个窗口（或结束 PID ' + lock.otherPid + '）');
+      log('     2. 再运行本程序');
+      log('='.repeat(56));
+      process.exit(1);
+    }
+    // 退出时释放锁，避免留下僵尸锁
+    const bye = () => { releaseSingleInstanceLock(); };
+    process.on('exit', bye);
+    process.on('SIGINT', () => { bye(); process.exit(0); });
+    process.on('SIGTERM', () => { bye(); process.exit(0); });
+  }
 
   // 把配置接进模块级缓存
   cfg_cache.stickerCollect = cfg.stickers?.enabled !== false;
