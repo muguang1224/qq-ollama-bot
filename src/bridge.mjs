@@ -3,7 +3,13 @@
  * QQ ↔ 本地大模型（Ollama）直连桥
  *
  * 架构：
- *   QQ 客户端 ←→ NapCat（OneBot v11，WS 反向/正向）←→ 本脚本 ←→ Ollama
+ *   QQ ←→ OneBot v11 实现（SnowLuma / NapCat 都可以）←→ 本脚本 ←→ Ollama
+ *
+ * OneBot 后端：
+ *   当前用 SnowLuma（默认 3001）。NapCat 也兼容 —— 两者都说 OneBot v11，
+ *   只是各自的 accessToken 不同，改 config.json 的 onebot.accessToken 即可切换。
+ *   NapCat 换成 SnowLuma 的原因：NapCat 的 OneBot 适配器反复掉线
+ *   （QQ 进程还在，但 3001 端口不再监听），表现为机器人静默不回消息。
  *
  * 不依赖 DSH、不依赖 qq-bridge。纯 Node，零第三方依赖。
  *
@@ -1310,7 +1316,7 @@ class OneBot {
     const url = this.cfg.onebot.url;
     log('正在连接 OneBot（正向）: ' + url);
     this.#open(url, () => {
-      log('已连接。等待 NapCat 推送消息…');
+      log('已连接。等待 OneBot 推送消息…');
     });
   }
 
