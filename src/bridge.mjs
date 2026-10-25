@@ -769,18 +769,48 @@ async function maybeFollowUp(bot, ev, key, emoRec, userText, reply) {
       return;
     }
 
-    // 稍微延迟一下，像真人在打字
-    const delay = 1200 + Math.floor(Math.random() * 1800);
+    // 稍微延迟一下，像真人在打字。
+    //
+    // 原来是 1.2~3 秒。实测下来太急了 —— 主回复发完 4 秒就追一条，
+    // 连着两条消息在 QQ 里看起来像刷屏，尤其在对方还没回复的时候。
+    // 真人补话通常是「想了一下才再说」，所以拉长到 4~9 秒。
+    const delay = 4000 + Math.floor(Math.random() * 5000);
+    log('  💬 打算补一句，等 ' + (delay / 1000).toFixed(1) + 's 再发…');
     await new Promise((r) => setTimeout(r, delay));
 
-    if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, d.message);
-    else await bot.sendPrivate(ev.user_id, d.message);
+    // 等待期间对方可能已经回话了 —— 那就别再补，否则像在自说自话。
+    // lastReplyAt 会在收到并回复新消息时被刷新，用它判断。
+    const since = Date.now() - (lastReplyAt.get(key) || 0);
+    if (since < delay - 500) {
+      log('  💬 等待期间已经聊上了，不补话');
+      return;
+    }
+
+    // 补的话也要过 sanitize —— 主回复是过滤过的，追问之前没过滤，
+    // 会出现「主回复没标点、补的那句反而带标点」，语气不一致。
+    const followText = sanitize(d.message, {
+      isOwner: !!cfg_cache.cfg?.bot?.owner &&
+               String(ev.user_id) === String(cfg_cache.cfg.bot.owner),
+      ownerName: cfg_cache.cfg?.bot?.ownerName || '爸爸',
+      isGroup: ev.message_type === 'group',
+    });
+    if (!followText) return;
+
+    // 补的话如果和刚发的那句几乎一样，就别发了 —— 看起来像复读。
+    // 出现过「主回复」和「补一句」内容雷同、只差标点的情况。
+    if (isNearDuplicate(followText, reply)) {
+      log('  💬 补话与上一条雷同，跳过: ' + followText.slice(0, 30));
+      return;
+    }
+
+    if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, followText);
+    else await bot.sendPrivate(ev.user_id, followText);
 
     // 补的话也要进历史，否则下一轮模型不知道它自己刚说过什么
-    remember(key, 'assistant', d.message, cfg_cache.cfg?.reply?.contextTurns ?? 10);
+    remember(key, 'assistant', followText, cfg_cache.cfg?.reply?.contextTurns ?? 10);
 
     Proactive.markFollowUp(key);
-    log('  💬 补一句: ' + d.message + '   [' + d.reason + ']');
+    log('  💬 补一句: ' + followText + '   [' + d.reason + ']');
   } catch (e) {
     log('  💬 补话失败: ' + e.message);
   }
@@ -1089,6 +1119,13 @@ const awaitingReply = new Map();
 
 /** 上次回复时间：key -> 时间戳（用于 reply.cooldownMs 限速，防群聊刷屏） */
 const lastReplyAt = new Map();
+
+/**
+ * 已处理过的消息 id（去重用）。
+ * OneBot 正常不会重复推送，但适配器重连、多个后端同时在线时可能重复，
+ * 表现就是同一句话被回两遍。用 message_id 兜一层。
+ */
+const seenMessageIds = new Set();
 
 /**
  * 主动聊天调度器。
@@ -1443,8 +1480,63 @@ class OneBot {
     });
   }
 
-  sendPrivate(userId, text) { return this.call('send_private_msg', { user_id: userId, message: text }); }
-  sendGroup(groupId, text) { return this.call('send_group_msg', { group_id: groupId, message: text }); }
+  /**
+   * 发送私聊。
+   *
+   * 诊断：这里统一记一条日志，带调用来源。
+   * 起因是出现过「同一句话发两遍」（一条带标点、一条不带），
+   * 需要区分是模型真的生成了两条，还是同一段代码走了两条路径。
+   * caller 从调用栈里取，不用调用方传参。
+   */
+  sendPrivate(userId, text) {
+    log('  → 私聊 ' + userId + ' [sendPrivate/' + callerTag() + ']: ' + String(text).slice(0, 40));
+    return this.call('send_private_msg', { user_id: userId, message: text });
+  }
+
+  sendGroup(groupId, text) {
+    log('  → 群 ' + groupId + ' [sendGroup/' + callerTag() + ']: ' + String(text).slice(0, 40));
+    return this.call('send_group_msg', { group_id: groupId, message: text });
+  }
+}
+
+/** 从调用栈里找出第一个非 bridge 内部的调用者名字，用于诊断重复发送 */
+function callerTag() {
+  const st = new Error().stack || '';
+  const lines = st.split('\n').slice(1);
+  for (const ln of lines) {
+    // 匹配 "at xxx (file:line:col)" 或 "at file:line:col"
+    const m = /\s+at\s+(?:([^\s(]+)\s+\()?([^)]+):(\d+):(\d+)\)?/.exec(ln);
+    if (!m) continue;
+    const fn = m[1] || '(anon)';
+    const line = m[3];
+    // 跳过 OneBot 类自己的方法
+    if (fn === 'sendPrivate' || fn === 'sendGroup' || fn === 'callerTag') continue;
+    return fn + '@' + line;
+  }
+  return '?';
+}
+
+/**
+ * 判断两句话是否「几乎是同一句」。
+ *
+ * 用途：追问功能有时会生成和主回复几乎一样的句子（只差标点/空格），
+ * 发出去就像复读机。
+ *
+ * 做法：去掉所有标点、空白、常见语气词后比较。
+ * 归一化后相等 → 重复；否则算长度相近的包含关系。
+ */
+function isNearDuplicate(a, b) {
+  const norm = (s) => String(s || '')
+    .replace(/[\s，,。.！!？?、~～…·:：;；"'「」『』()（）]/g, '')
+    .replace(/[呀啊呢吧啦嘛哦喔诶哎嗯哈]+$/g, '');
+  const na = norm(a);
+  const nb = norm(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // 短句包含长句的大部分内容，也视为重复
+  const [short, long] = na.length <= nb.length ? [na, nb] : [nb, na];
+  if (short.length >= 6 && long.includes(short)) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------- 主流程
@@ -1509,6 +1601,27 @@ async function main() {
   bot.on('message', async (ev) => {
     const key = memKey(ev);
     const text = plainText(ev);
+
+    // —— 消息去重 ——
+    // 出现过「同一句话被处理两次」的现象（一条带标点、一条不带）。
+    // OneBot 的消息都带 message_id，同一 id 重复推送就只处理一次。
+    // 这既能挡掉适配器的重复推送，也能防止重连后重放旧消息。
+    if (ev.message_id !== undefined && ev.message_id !== null) {
+      const mid = String(ev.message_id);
+      if (seenMessageIds.has(mid)) {
+        log('  ⏭ 重复消息已跳过 (message_id=' + mid + '): ' + String(text).slice(0, 30));
+        return;
+      }
+      seenMessageIds.add(mid);
+      // 只保留最近 500 个 id，避免长期运行内存涨
+      if (seenMessageIds.size > 500) {
+        const first = seenMessageIds.values().next().value;
+        seenMessageIds.delete(first);
+      }
+    }
+
+    log('  ← 收到 [' + (ev.message_type === 'group' ? '群' + ev.group_id : '私聊') + '] ' +
+        (ev.sender?.card || ev.sender?.nickname || ev.user_id) + ' (mid=' + ev.message_id + ')');
 
     // 记录所有进来的话（含没触发回复的，这样上下文更完整）
     remember(key, 'user', text, cfg.reply.contextTurns);
