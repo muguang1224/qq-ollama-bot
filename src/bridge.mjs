@@ -285,14 +285,17 @@ function sanitize(text, ctx) {
     return '我一直在待着呀 没别的事呢';
   }
 
-  // —— 称呼兜底：不是主人就不许用主人的称呼 ——
-  // 群里出现过「对谁都叫爸」的问题（主人判定在群聊里失效）。
-  // 这里做代码层兜底，把亲属称呼统一换成中性的「你」。
+  // —— 称呼兜底：不该叫的时候不许叫 ——
+  // 规则：
+  //   · 群聊 → **一律**不许用亲属称呼（哪怕说话的是主人，群里有别人看着）
+  //   · 私聊非主人 → 也不许用
+  //   · 只有「私聊主人」这一种情况保留
   //
   // 实现说明：一开始用了带 lookahead 的正则，但「爸你…」这种最常见的
   // 组合（称呼后直接跟「你」）反而匹配不到，所以改成直接字符串替换，
   // 更笨但更可靠。按长度从长到短替换，避免「爸爸」被「爸」先吃掉。
-  if (ctx && !ctx.isOwner) {
+  const blockOwnerAddr = ctx && (ctx.isGroup || !ctx.isOwner);
+  if (blockOwnerAddr) {
     const words = [ctx.ownerName || '爸爸', '爸爸', '老爸', '爸', '爹', '爹爹'];
     const before = t;
     for (const w of [...new Set(words)].sort((a, b) => b.length - a.length)) {
@@ -305,7 +308,8 @@ function sanitize(text, ctx) {
     t = t.replace(/你{2,}/g, '你');
     t = t.replace(/你[，,]\s*你/g, '你');
     if (t !== before) {
-      log('  ⚠️ 非主人场景出现主人称呼，已改为「你」：' + before.slice(0, 40));
+      log('  ⚠️ ' + (ctx.isGroup ? '群聊' : '非主人') +
+          '场景出现主人称呼，已改为「你」：' + before.slice(0, 40));
     }
   }
 
