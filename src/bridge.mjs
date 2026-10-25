@@ -25,6 +25,7 @@ import * as Emo from './emotion.mjs';
 import * as Stickers from './stickers.mjs';
 import * as Video from './video.mjs';
 import * as Qzone from './qzone.mjs';
+import * as TTS from './tts.mjs';
 
 // ---------------------------------------------------------------- 配置
 
@@ -100,6 +101,7 @@ const EXAMPLE = {
     enabled: true,
   },
   qzone: { ...Qzone.QZONE_DEFAULTS },
+  tts: { ...TTS.TTS_DEFAULTS },
 };
 
 function loadConfig() {
@@ -124,6 +126,7 @@ function loadConfig() {
     video: { enabled: true, frames: 3, width: 256, maxMB: 80, ...(raw.video || {}) },
     audio: { enabled: true, ...(raw.audio || {}) },
     qzone: { ...Qzone.QZONE_DEFAULTS, ...(raw.qzone || {}) },
+    tts: { ...TTS.TTS_DEFAULTS, ...(raw.tts || {}) },
   };
 }
 
@@ -926,6 +929,69 @@ async function maybeSendSticker(bot, ev, emoRec, userText, reply) {
   }
 }
 
+// ---------------------------------------------------------------- 发语音
+
+const lastVoiceAt = new Map();
+
+/**
+ * 按概率决定要不要把回复用【语音】再发一遍。
+ *
+ * 设计：
+ *   · 原文字回复照常发（保证一定能看到内容）
+ *   · 语音是「额外」补一条，像真人聊到兴头上会发条语音
+ *   · 只在实际发出后才记冷却
+ *
+ * 保守约束（语音比文字慢、也更容易被风控）：
+ *   · 默认关闭（tts.enabled = false）
+ *   · 概率默认 0.15
+ *   · 太短（"嗯""在"）和太长（>60字）都不发
+ *   · 同一个人冷却默认 30 分钟
+ *   · 需要联网（edge-tts 是微软在线服务）
+ */
+async function maybeSendVoice(bot, ev, emoRec, reply) {
+  const tc = cfg_cache.tts || {};
+  if (tc.enabled !== true) return;
+
+  const text = String(reply || '').trim();
+  if (!text) return;
+  if (text.length < (tc.minChars ?? 2)) return;
+  if (text.length > (tc.maxChars ?? 60)) return;
+
+  const key = String(ev.message_type === 'group' ? 'g:' + ev.group_id : 'p:' + ev.user_id);
+  const now = Date.now();
+  const cd = (tc.cooldownMin ?? 30) * 60000;
+  if (lastVoiceAt.has(key) && now - lastVoiceAt.get(key) < cd) return;
+
+  let chance = tc.chance ?? 0.15;
+  // 情绪加成：心情好、关系熟时更愿意"开口说话"
+  if (emoRec?.mood >= 75) chance += 0.08;
+  if (emoRec?.intimacy >= 60) chance += 0.07;
+  if (emoRec?.mood <= 30) chance -= 0.08;
+  chance = Math.max(0, Math.min(0.5, chance));
+
+  if (Math.random() > chance) return;
+
+  // 合成
+  const t0 = Date.now();
+  const r = await TTS.synthesize(text, cfg_cache);
+  if (!r.ok) {
+    log('  🎤 语音合成失败: ' + r.error);
+    return;
+  }
+
+  // 发送：OneBot 的 record 段，NapCat 会自动转 SILK
+  try {
+    const msg = [{ type: 'record', data: { file: r.fileUrl } }];
+    if (ev.message_type === 'group') await bot.call('send_group_msg', { group_id: ev.group_id, message: msg }, 60000);
+    else await bot.call('send_private_msg', { user_id: ev.user_id, message: msg }, 60000);
+    lastVoiceAt.set(key, now);
+    log('  🎤 语音已发（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）: ' + text.slice(0, 30));
+    try { TTS.cleanupCache(30); } catch {}
+  } catch (e) {
+    log('  🎤 发语音失败: ' + e.message);
+  }
+}
+
 /**
  * 让模型从候选表情里挑一张。
  *
@@ -1628,6 +1694,9 @@ async function main() {
       // —— 按情绪决定要不要配一张表情包 ——
       await maybeSendSticker(bot, ev, emoRec, text, reply);
 
+      // —— 按概率把刚说的话用语音再发一遍 ——
+      await maybeSendVoice(bot, ev, emoRec, reply);
+
       // —— 会话内追问：有时再补一句，让对话不是一问一答就结束 ——
       await maybeFollowUp(bot, ev, key, emoRec, text, reply);
 
@@ -1670,6 +1739,23 @@ async function main() {
 
   // QQ空间自动发说说
   startQzone(bot, cfg);
+
+  // 语音合成状态
+  {
+    const tc = cfg.tts || {};
+    if (tc.enabled !== true) {
+      log('发语音：未开启（config.json 的 tts.enabled）');
+    } else {
+      const why = TTS.unavailableReason(cfg);
+      if (why) {
+        log('⚠️ 发语音：不可用 —— ' + why);
+      } else {
+        log('发语音：已开启，语音 ' + (tc.voice || 'zh-CN-XiaoyiNeural') +
+            '，概率 ' + Math.round((tc.chance ?? 0.15) * 100) + '%' +
+            '，冷却 ' + (tc.cooldownMin ?? 30) + ' 分钟');
+      }
+    }
+  }
 
   // 表情库后台标注：空闲时慢慢把没收据的图"看"一遍
   if (cfg.vision?.enabled !== false) {
