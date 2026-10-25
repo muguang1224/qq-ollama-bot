@@ -1864,12 +1864,23 @@ async function main() {
     const tc = cfg.tts || {};
     if (tc.enabled !== true) {
       log('发语音：未开启（config.json 的 tts.enabled）');
+    } else if (tc.engine === 'sovits') {
+      log('发语音：已开启，引擎 GPT-SoVITS 克隆音色 ' + tc.sovitsUrl +
+          '，概率 ' + Math.round((tc.chance ?? 0.15) * 100) + '%' +
+          '，冷却 ' + (tc.cooldownMin ?? 30) + ' 分钟');
+      // 异步探测克隆服务，别拖慢启动
+      TTS.sovitsAvailable(cfg).then((ok) => {
+        if (ok) log('  ✅ GPT-SoVITS 服务在线');
+        else log('  ⚠️ GPT-SoVITS 服务没响应（' + tc.sovitsUrl +
+                 '）—— 发语音会回退到 edge-tts。启动它：' +
+                 'D:\\GPT-SoVITS\\...\\runtime\\python.exe api_v2.py');
+      }).catch(() => {});
     } else {
       const why = TTS.unavailableReason(cfg);
       if (why) {
         log('⚠️ 发语音：不可用 —— ' + why);
       } else {
-        log('发语音：已开启，语音 ' + (tc.voice || 'zh-CN-XiaoyiNeural') +
+        log('发语音：已开启，引擎 edge-tts，语音 ' + (tc.voice || 'zh-CN-XiaoyiNeural') +
             '，概率 ' + Math.round((tc.chance ?? 0.15) * 100) + '%' +
             '，冷却 ' + (tc.cooldownMin ?? 30) + ' 分钟');
       }

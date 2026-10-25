@@ -29,6 +29,7 @@ QQ  ←→  NapCat (OneBot v11)  ←→  本项目  ←→  Ollama (本地模型
 | **主动聊天** | 可开启，让它偶尔主动找你说话（带多重防打扰机制） |
 | **会话内追问** | 回完一句后有时再补一句，不是一问一答就结束 |
 | **自动加好友** | 可开启，按关键词或白名单自动通过好友申请 |
+| **发语音** | 能把回复用语音再说一遍；支持**声音克隆**（用你指定的音色） |
 | **QQ 空间说说** | 可开启，按心情自动发说说（低频、限时段、可配图） |
 | **群聊对话状态** | 群里被 @ 一次后，接下来几分钟不用重复 @ 也能接着聊 |
 | **主人设定** | 指定一个 QQ 号为主人，用固定称呼，且不受人设进化覆盖 |
@@ -387,6 +388,104 @@ node src/bridge.mjs
 **视频比较重**（下载 + 抽帧 + 逐帧识别），觉得慢或不需要就直接
 `"video": { "enabled": false }`。
 
+### 想让它发语音
+
+它能把回复**用语音再发一遍**（文字照常发，语音是额外补的一条）。
+
+```jsonc
+"tts": {
+  "enabled": true,
+  "engine": "edge",                // edge（微软在线）| sovits（克隆音色）
+  "chance": 0.15,                  // 随机发语音的概率
+  "cooldownMin": 30,               // 同一个人多久内不发第二条
+  "maxChars": 60                   // 太长的合成慢，不发
+}
+```
+
+**两个引擎的区别：**
+
+| 引擎 | 音色 | 需要什么 | 速度 |
+| --- | --- | --- | --- |
+| `edge` | 固定的微软音色 | 联网 + `pip install edge-tts` | 2~4 秒 |
+| `sovits` | **你指定的音色**（声音克隆） | 本地跑 GPT-SoVITS + 显卡 | 1~3 秒 |
+
+**`edge` 可选的中文女声**（改 `voice`）：
+
+```
+zh-CN-XiaoxiaoNeural     温暖
+zh-CN-XiaoyiNeural       活泼（默认）
+zh-CN-liaoning-XiaobeiNeural   东北话
+zh-CN-shaanxi-XiaoniNeural     陕西话
+```
+
+> 语音比文字更容易触发风控，所以默认概率只有 15%、同人冷却 30 分钟。
+> 想更频繁就把 `chance` 调高，但别调太狠。
+
+### 想让它用指定的音色说话（声音克隆）
+
+这就是 `engine: "sovits"`。用的是 [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)：
+给一段参考音频，它就能用那个音色说话，**零样本、不用训练**。
+
+**步骤：**
+
+**1. 装 GPT-SoVITS**
+
+下载官方 Windows 整合包（自带 Python 和依赖，不用自己配环境）：
+
+```
+https://github.com/RVC-Boss/GPT-SoVITS/releases
+```
+
+有 **50 系 N 卡特供版**（40 系/30 系用普通版）。解压后大概 15GB。
+
+**2. 准备参考音频**
+
+- **5~10 秒**清晰人声，**越干净越好**（有伴奏会明显影响效果）
+- 人声和伴奏混在一起的话，先用 [Demucs](https://github.com/facebookresearch/demucs) 分离：
+  ```bash
+  pip install demucs
+  python -m demucs --two-stems=vocals -n htdemucs_ft -o out 你的音频.mp3
+  # 结果在 out/htdemucs_ft/<文件名>/vocals.wav
+  ```
+- 放到项目的 `voice-ref/ref_b.wav`
+
+**3. 配置**
+
+```jsonc
+"tts": {
+  "enabled": true,
+  "engine": "sovits",
+  "sovitsUrl": "http://127.0.0.1:9880/tts",
+  "sovitsRef": "",                                  // 留空用 voice-ref/ref_b.wav
+  "sovitsPrompt": "参考音频里说的那句话",              // ⚠️ 必须准确
+  "sovitsSpeed": 1.0,
+  "sovitsTemperature": 0.8,
+  "sovitsTopK": 6,
+  "sovitsTopP": 0.85
+}
+```
+
+**4. 启动语音服务**
+
+双击 `start-sovits.bat`（`一键启动.bat` 里也会自动带上这一步）。
+加载模型约 60 秒，之后每句话只要 1~3 秒。
+
+**调音色的小抄：**
+
+| 想要的效果 | 怎么调 |
+| --- | --- |
+| 更稳、更像参考音 | `sovitsTemperature` 调低（0.5~0.8） |
+| 更活、更开朗 | `sovitsTemperature` 调高（1.0~1.2）、`sovitsTopK` 调大 |
+| 语速快/慢 | `sovitsSpeed`（1.0 是原速） |
+| **总觉得"闷"** | 先换参考音频段落 —— 参数能调的有限 |
+
+**⚠️ 关于参考音频的版权：**
+
+**用别人的声音（尤其配音演员、虚拟角色的）公开发布语音，可能侵权。**
+`voice-ref/` 已在 `.gitignore` 里，不会上传。建议只在熟人小范围用。
+
+### 想自动发 QQ 空间
+
 ---
 
 ## 改人设
@@ -448,6 +547,7 @@ qq-ollama-bot/
     ├── emotion.mjs           ← 情绪系统
     ├── stickers.mjs          ← 表情包收集 / 视觉识别 / GIF 解码 / 图片缩放
     ├── video.mjs             ← 视频抽帧 + 语音消息判断
+    ├── tts.mjs               ← 发语音（edge-tts / GPT-SoVITS 双引擎）
     ├── qzone.mjs             ← QQ 空间发说说（情绪驱动内容 + 低频限制）
     ├── qzone-api.mjs         ← 空间接口封装（凭证 / bkn / 发布）
     ├── yolo.mjs              ← YOLO 调用（Node ↔ Python）
