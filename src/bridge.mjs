@@ -912,7 +912,7 @@ async function describeIncomingVideo(bot, ev, key) {
       if (last) last.content = (last.content || '') + note;
       saveCtx(key, hist);
     }
-    return { summary, duration, parts, asr };
+    return { summary, duration, parts, asr, note };
   } catch (e) {
     log('  🎬 视频处理出错: ' + e.message);
   }
@@ -2420,6 +2420,9 @@ async function main() {
     // 现在分两档：
     //   - 图片(≤1s)、语音(≤2s)：同步等，这样回复时就能用上内容
     //   - 视频(几十秒)：等一下再回复（见下面），有超时兜底
+    // 视频描述文本，等视频处理完填充；拼 messages 时要用它补当前消息
+    let vrNote = '';
+
     if (hasVideoSeg(ev)) {
       log('  🎬 消息段含视频: ' + JSON.stringify(
         (Array.isArray(ev.message) ? ev.message : []).map((s) => s.type)
@@ -2437,6 +2440,7 @@ async function main() {
       log('  🎬 检测到视频段，等识别完再回复（最多 ' +
           ((cfg_cache.video?.waitMs ?? 100000) / 1000).toFixed(0) + 's）');
       const vr = await understandVideoBeforeReply(bot, ev, key, log);
+      vrNote = vr.note || '';      // 供后面拼当前消息用
       if (!vr.summary) {
         // 没等到结果，先应一声。
         //
@@ -2706,10 +2710,39 @@ async function main() {
         }
       }
 
+      // —— 关键：当前这条消息的真实内容 ——
+      //
+      // 踩过的坑：text 来自 plainText(ev)，对视频消息来说就是 "[视频]" 四个字。
+      // 而视频的识别结果（画面 + 台词）是**异步**写进历史的。
+      // 于是拼出来的 messages 是：
+      //    [历史] [视频] + 完整描述 + 台词        <- 有内容
+      //    [当前] [视频]                          <- 光秃秃，没内容
+      // 模型去回答最后这条没内容的，自然说"发文件来啦""我看看里面是什么"。
+      //
+      // 所以：如果这条消息是视频、且历史里已经有了它的描述，
+      // 就把描述补到当前这条后面，让最后一条也有内容。
+      let currentText = text;
+      if (hasVideoSeg(ev)) {
+        try {
+          const h = history(key);
+          const lastUser = [...(h || [])].reverse().find((m) => m.role === 'user');
+          const lc = String(lastUser?.content || '');
+          if (lc.startsWith(text) && lc.length > text.length + 20) {
+            currentText = lc;             // 用带描述的那份
+            log('  🎬 当前消息已带视频描述（' + lc.length + ' 字），作为本轮输入');
+          } else if (vrNote) {
+            currentText = text + vrNote;
+            log('  🎬 把视频描述补到当前消息上（' + vrNote.length + ' 字）');
+          }
+        } catch (e) {
+          log('  ⚠️ 取视频描述失败: ' + e.message);
+        }
+      }
+
       const msgs = [
         { role: 'system', content: systemPrompt },
         ...ctxHist,
-        { role: 'user', content: text },
+        { role: 'user', content: currentText },
       ];
       const raw = await ollamaChat(msgs, cfg);
       const reply = sanitize(raw, {
