@@ -186,35 +186,69 @@ export function cleanupWork() {
  * @param {function} describeFrame  单帧识别函数（由 stickers.describe 提供）
  * @returns {Promise<{summary:string, parts:string[]}>}
  */
-export async function describeVideo(frames, cfg, describeFrame, log) {
+export async function describeVideo(frames, cfg, describeFrame, log, duration) {
   const parts = [];
-  for (const f of frames) {
+  for (let i = 0; i < frames.length; i++) {
     try {
-      const d = await describeFrame(f, cfg, 90000);
+      const d = await describeFrame(frames[i], cfg, 90000);
       const t = (d.visual || '').trim();
-      if (t) parts.push(t);
+      if (t) parts.push({ i, text: t });
     } catch (e) {
       if (log) log('    帧识别失败: ' + e.message.slice(0, 50));
     }
   }
   if (!parts.length) return { summary: '', parts: [] };
 
-  // 拼成一句：如果几帧描述相近，就去重
+  // 去重：只在完全相同、或一个是另一个的子串时才合并。
+  //
+  // 原来写的是 `p.includes(u.slice(0, 6))` —— 取前 6 个字比较，
+  // 结果「一个红发少女」和「一个红发女孩」前 6 字相同就被当成重复丢掉了，
+  // 可它们描述的是不同画面。现在收紧到"完整包含"才算重复。
   const uniq = [];
   for (const p of parts) {
-    if (!uniq.some((u) => u === p || (u.length > 6 && p.includes(u.slice(0, 6))))) uniq.push(p);
+    const dup = uniq.some((u) =>
+      u.text === p.text ||
+      (p.text.length >= 8 && u.text.includes(p.text)) ||
+      (u.text.length >= 8 && p.text.includes(u.text))
+    );
+    if (!dup) uniq.push(p);
   }
-  const summary = uniq.join('；');
-  return { summary, parts: uniq };
+
+  // 带时间线：让模型知道画面的先后，才能讲出"发生了什么"。
+  // 抽帧位置和 extractFrames 保持一致（时长已知时按 10%~90% 均匀分布）。
+  const n = frames.length;
+  const dur = Number(duration) || 0;
+  let summary;
+
+  if (dur > 0 && n > 1) {
+    summary = uniq.map((u) => {
+      const ratio = 0.1 + 0.8 * (u.i / (n - 1));
+      return Math.round(dur * ratio) + 's: ' + u.text;
+    }).join('  ');
+  } else {
+    summary = uniq.map((u) => u.text).join('；');
+  }
+
+  return { summary, parts: uniq.map((u) => u.text) };
 }
 
-/** 生成给模型看的描述文本（说明这只是抽样，不是完整理解） */
+/**
+ * 生成给模型看的描述文本。
+ *
+ * 必须明确告诉它「这只是抽样」—— 否则它会以为自己看完了整个视频，
+ * 然后拿 8 个瞬间去讲完整剧情，那就是编造。
+ */
 export function renderVideoNote(video) {
   if (!video) return '';
   const bits = [];
   if (video.duration) bits.push('时长约 ' + Math.round(video.duration) + ' 秒');
-  if (video.summary) bits.push('画面抽样：' + video.summary);
+  if (video.summary) {
+    // 去掉 summary 结尾的标点，免得和拼接时的句号撞在一起（"。。"）
+    bits.push('画面按时间抽样：' + String(video.summary).replace(/[。；;，,、\s]+$/, ''));
+  }
   if (!bits.length) return '';
   return '\n（对方发了一段视频：' + bits.join('，') +
-    '。这只是抽了几帧看的，不知道具体过程和声音。）';
+    '。这是每隔几秒抽一帧看到的画面，' +
+    '中间的过程、人物说的话、以及声音你都没有听到 —— ' +
+    '所以可以聊画面里出现的东西，但别断言"剧情讲了什么"。）';
 }

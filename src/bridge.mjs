@@ -848,7 +848,7 @@ async function describeIncomingVideo(bot, ev, key) {
 
     log('  🎬 抽到 ' + frames.length + ' 帧，识别中…');
     const { summary, parts } = await Video.describeVideo(
-      frames, cfg_cache.cfg || {}, Stickers.describe, log
+      frames, cfg_cache.cfg || {}, Stickers.describe, log, duration
     );
     Video.cleanupFrames(frames);
 
@@ -2289,7 +2289,12 @@ async function main() {
     //
     // 现在分两档：
     //   - 图片(≤1s)、语音(≤2s)：同步等，这样回复时就能用上内容
-    //   - 视频(几十秒)：丢到后台跑，【先回复】再说
+    //   - 视频(几十秒)：等一下再回复（见下面），有超时兜底
+    if (hasVideoSeg(ev)) {
+      log('  🎬 消息段含视频: ' + JSON.stringify(
+        (Array.isArray(ev.message) ? ev.message : []).map((s) => s.type)
+      ));
+    }
     await understandMedia(bot, ev, key, { skipVideo: true });
 
     // 视频：等一下，识别完再回复。
@@ -2299,6 +2304,8 @@ async function main() {
     // 84 秒后才识别完 —— 明明在看却装作没看见。
     // 现在改成等（有上限），拿到内容一起回复。超时再退回旧行为。
     if (cfg.video?.enabled !== false && hasVideoSeg(ev)) {
+      log('  🎬 检测到视频段，等识别完再回复（最多 ' +
+          ((cfg_cache.video?.waitMs ?? 100000) / 1000).toFixed(0) + 's）');
       const vr = await understandVideoBeforeReply(bot, ev, key, log);
       if (!vr.summary) {
         // 没等到结果：告诉模型"你还在看"，先应一声
