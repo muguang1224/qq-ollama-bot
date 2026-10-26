@@ -34,6 +34,7 @@ import * as Qzone from './qzone.mjs';
 import * as TTS from './tts.mjs';
 import * as Search from './search.mjs';
 import * as Douyin from './douyin.mjs';
+import * as Bili from './bili.mjs';
 
 // ---------------------------------------------------------------- 配置
 
@@ -111,6 +112,7 @@ const EXAMPLE = {
   qzone: { ...Qzone.QZONE_DEFAULTS },
   tts: { ...TTS.TTS_DEFAULTS },
   search: { ...Search.SEARCH_DEFAULTS },
+  bili: { ...Bili.BILI_DEFAULTS },
 };
 
 function loadConfig() {
@@ -137,6 +139,7 @@ function loadConfig() {
     qzone: { ...Qzone.QZONE_DEFAULTS, ...(raw.qzone || {}) },
     tts: { ...TTS.TTS_DEFAULTS, ...(raw.tts || {}) },
     search: { ...Search.SEARCH_DEFAULTS, ...(raw.search || {}) },
+    bili: { ...Bili.BILI_DEFAULTS, ...(raw.bili || {}) },
   };
 }
 
@@ -1473,6 +1476,111 @@ function startProactive(bot, cfg) {
 
 // ---------------------------------------------------------------- QQ 空间
 
+// ---------------------------------------------------------------- B站主动分享
+
+/**
+ * B 站"刷到好玩的就聊"调度器。
+ *
+ * 和主动聊天的区别：
+ *   主动聊天是"想起来就找你说句话"（无素材）
+ *   这个是"看到个视频，想跟你说"（有具体素材）
+ *
+ * 约束（避免变成刷屏机）：
+ *   · 默认关闭，要显式开 bili.proactiveShare
+ *   · 每天上限 + 最小间隔
+ *   · 每次看热门时只有 shareChance 概率真的发
+ *   · 安静时段不发
+ *   · 只对主人发（和主动聊天保持一致，不骚扰别人）
+ */
+const BILI_STATE_FILE = join(ROOT, 'bili', 'state.json');
+
+function loadBiliState() {
+  try {
+    if (!existsSync(BILI_STATE_FILE)) return { history: [] };
+    return JSON.parse(readFileSync(BILI_STATE_FILE, 'utf8'));
+  } catch { return { history: [] }; }
+}
+function saveBiliState(st) {
+  try {
+    const dir = join(ROOT, 'bili');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(BILI_STATE_FILE, JSON.stringify(st, null, 2));
+  } catch {}
+}
+
+function startBiliShare(bot, cfg) {
+  const bc = cfg.bili || {};
+  if (bc.enabled !== true || bc.proactiveShare !== true) return;
+
+  const owner = cfg.bot?.owner;
+  if (!owner) {
+    log('B站分享：未配置 bot.owner，不知道该发给谁，跳过');
+    return;
+  }
+
+  log('B站分享：已开启，每 ' + (bc.checkEveryMin ?? 120) + ' 分钟看一次热门，' +
+      '概率 ' + Math.round((bc.shareChance ?? 0.25) * 100) + '%，' +
+      '每天最多 ' + (bc.maxSharePerDay ?? 2) + ' 条');
+
+  const tick = async () => {
+    try {
+      const h = new Date().getHours();
+      if (h >= (bc.quietStart ?? 1) && h < (bc.quietEnd ?? 8)) return;
+
+      const st = loadBiliState();
+      const today = st.history.filter((x) => x.at >= new Date().setHours(0, 0, 0, 0));
+      if (today.length >= (bc.maxSharePerDay ?? 2)) return;
+
+      const last = st.history[st.history.length - 1];
+      if (last && Date.now() - last.at < (bc.minGapHours ?? 6) * 3600000) return;
+
+      if (Math.random() > (bc.shareChance ?? 0.25)) return;
+
+      const pop = await Bili.popular(cfg);
+      if (!pop.ok || !pop.videos.length) {
+        log('B站分享：拿热门失败 ' + (pop.error || ''));
+        return;
+      }
+
+      const seen = new Set(st.history.map((x) => x.bvid));
+      const fresh = pop.videos.filter((v) => v.bvid && !seen.has(v.bvid));
+      if (!fresh.length) return;
+
+      const pick = await Bili.thinkShare({
+        persona: PERSONA,
+        videos: fresh,
+        history: st.history.slice(-5),
+        // 复用主模型调用；thinkShare 需要 (messages, opts) 形态
+        chat: (messages, opt = {}) => ollamaChat(messages, {
+          ...cfg,
+          reply: {
+            ...cfg.reply,
+            maxTokens: opt.numPredict ?? 200,
+            temperature: opt.temperature ?? 0.9,
+          },
+        }),
+      }, cfg);
+      if (!pick || !pick.message) return;
+
+      await bot.sendPrivate(owner, pick.message);
+      st.history = [...st.history, {
+        at: Date.now(), bvid: pick.bvid || fresh[0].bvid,
+        title: (fresh.find((v) => v.bvid === pick.bvid) || fresh[0]).title,
+        message: pick.message,
+      }].slice(-100);
+      saveBiliState(st);
+      log('📺 主动分享 B 站: ' + pick.message + '   [' + (pick.reason || '') + ']');
+    } catch (e) {
+      log('B站分享出错：' + e.message);
+    }
+  };
+
+  setTimeout(tick, 5 * 60000);   // 启动 5 分钟后第一次
+  setInterval(tick, (bc.checkEveryMin ?? 120) * 60000);
+}
+
+// ---------------------------------------------------------------- QQ 空间
+
 /** QQ空间的运行时句柄（startQzone 里填充），供消息处理里的「按需发布」使用 */
 const qzoneRuntime = { ready: false, chat: null, getCred: null };
 
@@ -1792,6 +1900,7 @@ async function main() {
   cfg_cache.tts = cfg.tts || {};
   cfg_cache.search = cfg.search || {};
   cfg_cache.douyin = cfg.douyin || {};
+  cfg_cache.bili = cfg.bili || {};
   cfg_cache.cfg = cfg;
 
   log('='.repeat(56));
@@ -2071,6 +2180,44 @@ async function main() {
         }
       }
 
+      // —— B 站 ——
+      // B 站有正规开放 API（实测 code:0 直连可用），所以这里是真的能拿到数据。
+      // 两种触发：① 消息里有 B 站链接/BV号 ② 明确问 B 站热门/排行
+      if (cfg.bili?.enabled === true) {
+        const bl = Bili.findBiliLink(text);
+        if (bl) {
+          log('  📺 检测到 B 站链接: ' + bl.type + ' ' + bl.id);
+          let info = null;
+          if (bl.type === 'bvid') info = await Bili.videoInfo(bl.id, cfg);
+          if (info && info.ok) {
+            log('  📺 拿到视频信息: ' + info.video.title.slice(0, 40));
+            systemPrompt += '\n\n【对方发的 B 站视频，你查到的真实信息】\n' +
+              '标题：' + info.video.title + '\n' +
+              'UP主：' + info.video.up + '\n' +
+              '播放：' + info.video.views + '   时长：' + info.video.duration + '\n' +
+              (info.video.desc ? '简介：' + info.video.desc + '\n' : '') +
+              '\n（这些是真实数据。可以聊标题和简介的内容，但你**没看过视频本身**，' +
+              '所以别评论"里面讲了什么"这种只有看过才知道的事。）';
+          } else {
+            systemPrompt += '\n\n【对方发了个 B 站链接】\n' +
+              '（你没取到详细信息。）可以说你打不开/没查到，别编内容。';
+          }
+        } else if (Bili.isBiliRequest(text)) {
+          log('  📺 有人在问 B 站内容');
+          const pop = await Bili.popular(cfg);
+          if (pop.ok && pop.videos.length) {
+            log('  📺 热门拿到 ' + pop.videos.length + ' 条');
+            systemPrompt += '\n\n【B 站当前热门，你刚查到的真实数据】\n' +
+              Bili.formatVideos(pop.videos) +
+              '\n\n（这是真实的 B 站热门列表。挑一两个自然地说说，' +
+              '比如哪个有意思、谁播放高。别念列表，别说是"查到的"，像自己刚刷到一样。' +
+              '但你只是看到了标题和播放量，**没看过视频内容** —— 别编里面讲了什么。）';
+          } else {
+            log('  📺 热门没拿到: ' + (pop.error || ''));
+          }
+        }
+      }
+
       // 取上下文：不包括"刚存进去的这条"（下面会单独作为 user 消息传入）
       //
       // 原来写的是 slice(0, -1)，假设"最后一条一定是刚存的 text"。
@@ -2165,6 +2312,9 @@ async function main() {
   // QQ空间自动发说说
   startQzone(bot, cfg);
 
+  // B站"刷到好玩的就聊"
+  startBiliShare(bot, cfg);
+
   // —— 配置缓存自检 ——
   // 踩过的坑：新增了 config 段，但忘了往 cfg_cache 里搬，
   // 导致启动日志说"已开启"、运行时却当成"没开"（语音功能就这么坏了半天）。
@@ -2180,6 +2330,7 @@ async function main() {
       ['tts', cfg.tts],
       ['search', cfg.search],
       ['douyin', cfg.douyin],
+      ['bili', cfg.bili],
     ];
     const missing = checks
       .filter(([k, v]) => v !== undefined && cfg_cache[k] === undefined)
@@ -2237,6 +2388,18 @@ async function main() {
     } else {
       log('抖音解析：已开启（注意：抖音反爬很严，只能尽力取标题，' +
           '取不到会说打不开；发视频文件给它看是可靠的）');
+    }
+  }
+
+  // B站状态
+  {
+    const bc = cfg.bili || {};
+    if (bc.enabled !== true) {
+      log('B站：未开启（config.json 的 bili.enabled）');
+    } else {
+      log('B站：已开启' + (bc.proactiveShare === true
+        ? '，会主动刷热门分享（每 ' + (bc.checkEveryMin ?? 120) + ' 分钟看一次）'
+        : '，只在被问到时查'));
     }
   }
 

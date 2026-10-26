@@ -26,6 +26,9 @@ logs/
 # 单实例锁（运行时生成，含本机 pid）
 .bridge.lock
 
+# B站分享状态（含分享历史）
+bili/
+
 # 备份
 *.bak
 
