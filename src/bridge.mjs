@@ -35,6 +35,7 @@ import * as TTS from './tts.mjs';
 import * as Search from './search.mjs';
 import * as Douyin from './douyin.mjs';
 import * as Bili from './bili.mjs';
+import * as Vram from './vram.mjs';
 
 // ---------------------------------------------------------------- 配置
 
@@ -113,6 +114,7 @@ const EXAMPLE = {
   tts: { ...TTS.TTS_DEFAULTS },
   search: { ...Search.SEARCH_DEFAULTS },
   bili: { ...Bili.BILI_DEFAULTS },
+  vram: { autoFree: true, minFreeVramMB: 6000, waitMs: 4000 },
 };
 
 function loadConfig() {
@@ -140,6 +142,7 @@ function loadConfig() {
     tts: { ...TTS.TTS_DEFAULTS, ...(raw.tts || {}) },
     search: { ...Search.SEARCH_DEFAULTS, ...(raw.search || {}) },
     bili: { ...Bili.BILI_DEFAULTS, ...(raw.bili || {}) },
+    vram: { autoFree: true, minFreeVramMB: 6000, waitMs: 4000, ...(raw.vram || {}) },
   };
 }
 
@@ -678,6 +681,9 @@ async function describeIncomingImages(bot, ev, key) {
   if (!file) return;
 
   try {
+    // 和视频一样：看图也要先腾显存，否则视觉模型加载会失败
+    await Vram.prepareForVision(cfg_cache.cfg || {}, log);
+
     const r = await bot.call('get_image', { file }, 30000);
     const local = r?.file;
     if (!local || !existsSync(local)) {
@@ -816,6 +822,12 @@ async function describeIncomingVideo(bot, ev, key) {
 
   try {
     log('  🎬 收到视频，正在取文件…');
+
+    // 视觉模型要吃 ~8.5GB，而 GPT-SoVITS 常驻占约 1.5GB 显存，
+    // 两个同时在场时 Ollama 必然加载失败（实测报 9.9GiB 不足）。
+    // 所以识别前先让它让位 —— 8GB 显存物理上放不下两个。
+    await Vram.prepareForVision(cfg_cache.cfg || {}, log);
+
     // 把段里的字段打出来，方便定位接口参数该怎么传
     // （SnowLuma 的 get_private_file_url 要 file_id，段里叫 file，
     //   而且"必要时传 file_hash" —— 到底有没有，看日志最快）
@@ -2143,6 +2155,7 @@ async function main() {
   cfg_cache.search = cfg.search || {};
   cfg_cache.douyin = cfg.douyin || {};
   cfg_cache.bili = cfg.bili || {};
+  cfg_cache.vram = cfg.vram || {};
   cfg_cache.cfg = cfg;
 
   log('='.repeat(56));
@@ -2597,6 +2610,7 @@ async function main() {
       ['search', cfg.search],
       ['douyin', cfg.douyin],
       ['bili', cfg.bili],
+      ['vram', cfg.vram],
     ];
     const missing = checks
       .filter(([k, v]) => v !== undefined && cfg_cache[k] === undefined)
@@ -2666,6 +2680,18 @@ async function main() {
       log('B站：已开启' + (bc.proactiveShare === true
         ? '，会主动刷热门分享（每 ' + (bc.checkEveryMin ?? 120) + ' 分钟看一次）'
         : '，只在被问到时查'));
+    }
+  }
+
+  // 显存仲裁状态
+  {
+    const vc = cfg.vram || {};
+    if (vc.autoFree === false) {
+      log('显存仲裁：未开启（看图可能因显存不足失败）');
+    } else {
+      const free = Vram.freeVramMB();
+      log('显存仲裁：已开启，看图/视频前自动让 GPT-SoVITS 让位' +
+          (free >= 0 ? '（当前显存空闲 ' + free + ' MB）' : ''));
     }
   }
 

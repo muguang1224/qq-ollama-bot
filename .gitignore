@@ -29,6 +29,9 @@ logs/
 # B站分享状态（含分享历史）
 bili/
 
+# 显存仲裁状态
+.vram-state.json
+
 # 备份
 *.bak
 
