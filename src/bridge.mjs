@@ -1329,19 +1329,27 @@ const lastVoiceAt = new Map();
  *   · 同一个人冷却默认 30 分钟
  *   · 需要联网（edge-tts 是微软在线服务）
  */
-async function maybeSendVoice(bot, ev, emoRec, reply) {
+/**
+ * 掷骰子：这条回复要不要改成"用语音说"。
+ *
+ * 拆成独立函数是因为决策必须在**发文字之前**发生 ——
+ * 决定发语音就只发语音，不再发同样的文字（否则对方收到两条一样的内容）。
+ *
+ * @returns {Promise<boolean>}
+ */
+async function willSendVoice(bot, ev, emoRec, reply) {
   const tc = cfg_cache.tts || {};
-  if (tc.enabled !== true) return;
+  if (tc.enabled !== true) return false;
 
   const text = String(reply || '').trim();
-  if (!text) return;
-  if (text.length < (tc.minChars ?? 2)) return;
-  if (text.length > (tc.maxChars ?? 60)) return;
+  if (!text) return false;
+  if (text.length < (tc.minChars ?? 2)) return false;
+  if (text.length > (tc.maxChars ?? 60)) return false;
 
   const key = String(ev.message_type === 'group' ? 'g:' + ev.group_id : 'p:' + ev.user_id);
   const now = Date.now();
   const cd = (tc.cooldownMin ?? 30) * 60000;
-  if (lastVoiceAt.has(key) && now - lastVoiceAt.get(key) < cd) return;
+  if (lastVoiceAt.has(key) && now - lastVoiceAt.get(key) < cd) return false;
 
   let chance = tc.chance ?? 0.15;
   // 情绪加成：心情好、关系熟时更愿意"开口说话"
@@ -1350,26 +1358,37 @@ async function maybeSendVoice(bot, ev, emoRec, reply) {
   if (emoRec?.mood <= 30) chance -= 0.08;
   chance = Math.max(0, Math.min(0.5, chance));
 
-  if (Math.random() > chance) return;
+  return Math.random() <= chance;
+}
 
-  // 合成
+/**
+ * 把这条回复用语音发出去。
+ * @returns {Promise<boolean>} 是否成功（失败时调用方退回发文字）
+ */
+async function sendVoiceAsReply(bot, ev, emoRec, reply) {
+  const text = String(reply || '').trim();
+  if (!text) return false;
+
+  const key = String(ev.message_type === 'group' ? 'g:' + ev.group_id : 'p:' + ev.user_id);
   const t0 = Date.now();
+
   const r = await TTS.synthesize(text, cfg_cache);
   if (!r.ok) {
     log('  🎤 语音合成失败: ' + r.error);
-    return;
+    return false;
   }
 
-  // 发送：OneBot 的 record 段，NapCat 会自动转 SILK
   try {
     const msg = [{ type: 'record', data: { file: r.fileUrl } }];
     if (ev.message_type === 'group') await bot.call('send_group_msg', { group_id: ev.group_id, message: msg }, 60000);
     else await bot.call('send_private_msg', { user_id: ev.user_id, message: msg }, 60000);
-    lastVoiceAt.set(key, now);
-    log('  🎤 语音已发（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）: ' + text.slice(0, 30));
+    lastVoiceAt.set(key, Date.now());
+    log('  🎤 语音回复（' + ((Date.now() - t0) / 1000).toFixed(1) + 's, 只发语音不发文字）: ' + text.slice(0, 40));
     try { TTS.cleanupCache(30); } catch {}
+    return true;
   } catch (e) {
     log('  🎤 发语音失败: ' + e.message);
+    return false;
   }
 }
 
@@ -2280,7 +2299,7 @@ async function main() {
   }
 
   // 把配置接进模块级缓存
-  // ⚠️ 新增配置段时一定要在这里补一行 —— maybeSendVoice / sendVoiceOnDemand
+  // ⚠️ 新增配置段时一定要在这里补一行 —— willSendVoice / sendVoiceAsReply
   // 读的是 cfg_cache.tts，漏了这行它们就永远认为功能没开（真出过这个 bug：
   // 启动日志显示"发语音已开启"，但用户说"发条语音"时它回"我这边语音没开着呀"）。
   cfg_cache.stickerCollect = cfg.stickers?.enabled !== false;
@@ -2699,18 +2718,34 @@ async function main() {
 
       remember(key, 'assistant', reply, cfg.reply.contextTurns);
 
-      if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, reply);
-      else await bot.sendPrivate(ev.user_id, reply);
-      log('  回复: ' + reply);
+      // —— 先决定这次是"打字"还是"开口" ——
+      //
+      // 原来是「先发文字，再按 15% 概率把同一句话用语音又发一遍」，
+      // 结果对方连着收到两条一模一样的内容（一条字、一条语音），
+      // 看起来像复读。现在改成二选一：要发语音就只发语音，不再发文字。
+      //
+      // 判断放在发文字之前，因为"发不发语音"要掷骰子，
+      // 掷完才知道该走哪条路。
+      let voiceSent = false;
+      if (!(await willSendVoice(bot, ev, emoRec, reply))) {
+        if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, reply);
+        else await bot.sendPrivate(ev.user_id, reply);
+        log('  回复: ' + reply);
+      } else {
+        voiceSent = await sendVoiceAsReply(bot, ev, emoRec, reply);
+        if (!voiceSent) {
+          // 合成失败就退回打字，不能让这条消息没了
+          if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, reply);
+          else await bot.sendPrivate(ev.user_id, reply);
+          log('  回复（语音失败退回文字）: ' + reply);
+        }
+      }
 
       // 记录本次回复时间，供冷却判断使用
       lastReplyAt.set(key, Date.now());
 
       // —— 按情绪决定要不要配一张表情包 ——
       await maybeSendSticker(bot, ev, emoRec, text, reply);
-
-      // —— 按概率把刚说的话用语音再发一遍 ——
-      await maybeSendVoice(bot, ev, emoRec, reply);
 
       // —— 会话内追问：有时再补一句，让对话不是一问一答就结束 ——
       await maybeFollowUp(bot, ev, key, emoRec, text, reply);
