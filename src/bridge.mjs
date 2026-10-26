@@ -301,6 +301,29 @@ function sanitize(text, ctx) {
     return '我一直在待着呀 没别的事呢';
   }
 
+  // —— 否认自己能力的兜底 ——
+  // 模型会周期性地"忘记"自己已经具备的能力，说些过时的话。
+  // 已经见过三次：
+  //   · "我进不去 QQ 空间"       ← 其实能发说说
+  //   · "语音没开着/我不会发语音" ← 其实能发
+  //   · "还在等新音色上线/现在是静音状态" ← 音色早就弄好了
+  // 这类话在人格里已经写了反例，但模型仍会偶尔复读（一旦说过一次
+  // 就会顺着上下文继续说），所以在代码层再兜一层。
+  const DENY_PATTERNS = [
+    /静音状态|还是静音|在静音/,
+    /等.{0,8}音色/,
+    /音色.{0,6}(上线|还在|没弄|没做|没调)/,
+    /(没|没有|发不出|发不了).{0,3}(声音|语音)/,
+    /(不会|不能).{0,4}(发语音|说话|出声)/,
+    /嗓子.{0,4}(还没|没好|不行|长)/,
+    /(进不去|打不开).{0,6}(QQ\s*)?空间/,
+  ];
+  const denied = DENY_PATTERNS.find((re) => re.test(t));
+  if (denied) {
+    log('  ⚠️ 检测到否认自己能力（' + denied + '），已替换：' + t.slice(0, 40));
+    return '我在呢 你说吧';
+  }
+
   // —— 称呼兜底：不该叫的时候不许叫 ——
   // 规则：
   //   · 群聊 → **一律**不许用亲属称呼（哪怕说话的是主人，群里有别人看着）
@@ -692,6 +715,82 @@ async function describeIncomingImages(bot, ev, key) {
  *   - 这只是抽了几帧，不知道过程，也听不到声音
  *   - 抽帧宽度必须 ≤256，512 会因内存不足失败
  */
+/**
+ * 取视频/文件的本地路径。
+ *
+ * 坑（SnowLuma 报错原文）：
+ *   get_file only resolves cached image/voice ids;
+ *   for group/normal files use get_group_file_url or get_private_file_url
+ *
+ * 也就是说 get_file 只对「图片/语音」有效，视频这类普通文件必须走
+ * get_private_file_url（私聊）/ get_group_file_url（群）。NapCat 那边
+ * get_file 有时也能凑合，所以这里按顺序都试一遍，谁先成功用谁。
+ *
+ * @returns {Promise<string|null>} 本地路径
+ */
+async function fetchVideoFile(bot, ev, seg, file) {
+  const isGroup = ev.message_type === 'group';
+  const attempts = [];
+
+  // ① 正路：私聊/群 各自的 file_url 接口
+  if (isGroup) {
+    attempts.push(['get_group_file_url', { group_id: ev.group_id, file_id: file }]);
+    attempts.push(['get_group_file_url', { group_id: ev.group_id, file }]);
+  } else {
+    attempts.push(['get_private_file_url', { user_id: ev.user_id, file_id: file }]);
+    attempts.push(['get_private_file_url', { user_id: ev.user_id, file }]);
+  }
+
+  // ② 兜底：get_file（对图片/语音有效，视频看后端实现）
+  attempts.push(['get_file', { file }]);
+
+  // ③ 有些实现直接给 url，那就下载
+  const directUrl = seg.data?.url;
+
+  for (const [action, params] of attempts) {
+    try {
+      const r = await bot.call(action, params, 120000);
+      // 可能是 {file: path} 也可能是 {url: 'http://...'}
+      const p = r?.file || r?.path || r?.data?.file;
+      if (p && existsSync(p)) return p;
+      const u = r?.url || r?.data?.url;
+      if (u && /^https?:\/\//.test(u)) {
+        const dl = await downloadToTemp(u, 'video');
+        if (dl) return dl;
+      }
+    } catch (e) {
+      log('  🎬 ' + action + ' 失败: ' + String(e.message || e).slice(0, 100));
+    }
+  }
+
+  // ④ 最后试原始 url
+  if (directUrl && /^https?:\/\//.test(directUrl)) {
+    const dl = await downloadToTemp(directUrl, 'video');
+    if (dl) return dl;
+  }
+
+  return null;
+}
+
+/** 下载到临时目录，返回本地路径 */
+async function downloadToTemp(url, tag) {
+  try {
+    const dir = join(ROOT, '.video-work');
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const out = join(dir, tag + '_' + Date.now() + '.mp4');
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (!buf.length) return null;
+    writeFileSync(out, buf);
+    log('  🎬 已下载 ' + (buf.length / 1048576).toFixed(1) + ' MB');
+    return out;
+  } catch (e) {
+    log('  🎬 下载失败: ' + e.message);
+    return null;
+  }
+}
+
 async function describeIncomingVideo(bot, ev, key) {
   if (cfg_cache.video?.enabled === false) return;
   const segs = ev.message;
@@ -705,9 +804,8 @@ async function describeIncomingVideo(bot, ev, key) {
 
   try {
     log('  🎬 收到视频，正在取文件…');
-    const r = await bot.call('get_file', { file }, 120000);
-    const local = r?.file;
-    if (!local || !existsSync(local)) {
+    const local = await fetchVideoFile(bot, ev, seg, file);
+    if (!local) {
       log('  🎬 视频文件拿不到，跳过');
       return;
     }
