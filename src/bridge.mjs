@@ -654,9 +654,8 @@ function collectStickers(bot, ev, text, key) {
     collecting++;
     (async () => {
       try {
-        const r = await bot.call('get_image', { file }, 30000);
-        const local = r?.file;
-        if (!local || !existsSync(local)) {
+        const local = await fetchImageFile(bot, ev, seg, file);
+        if (!local) {
           log('  🖼 图片下载失败: ' + file.slice(0, 30));
           return;
         }
@@ -688,6 +687,58 @@ function collectStickers(bot, ev, text, key) {
  *
  * 注意：这会串行等待视觉模型，所以限制一次最多 1 张，避免拖慢回复。
  */
+/**
+ * 取图片的本地路径，多方案降级。
+ *
+ * 踩过的坑：群里发的图片经常取不到，日志是「图片下载失败: 3DA2739696...」。
+ * 原因是只用 get_image 一条路 —— 而 SnowLuma 的 get_image
+ * 对群图片不一定能拿到（和视频那边 get_file 的情况类似，
+ * 服务端对"缓存过的图片"和"群文件"走的不是同一条路）。
+ *
+ * 所以按顺序都试一遍：
+ *   ① get_image（私聊图片的正路）
+ *   ② get_file（SnowLuma 可能把它映射到图片缓存）
+ *   ③ 段里直接带的 url -> 下载
+ *
+ * @returns {Promise<string|null>} 本地路径
+ */
+async function fetchImageFile(bot, ev, seg, file) {
+  const directUrl = seg.data?.url || (String(file).startsWith('http') ? file : '');
+
+  const attempts = [
+    ['get_image', { file }],
+    ['get_file', { file }],
+  ];
+  // 群图片有时要用 file_id
+  if (seg.data?.file_id && seg.data.file_id !== file) {
+    attempts.push(['get_image', { file: seg.data.file_id }]);
+    attempts.push(['get_file', { file: seg.data.file_id }]);
+  }
+  // file_unique 也是常见的备用字段
+  if (seg.data?.file_unique) {
+    attempts.push(['get_image', { file: seg.data.file_unique }]);
+  }
+
+  for (const [action, params] of attempts) {
+    try {
+      const r = await bot.call(action, params, 30000);
+      const p = r?.file || r?.path || r?.data?.file;
+      if (p && existsSync(p)) return p;
+      const u = r?.url || r?.data?.url;
+      if (u && /^https?:\/\//.test(u)) {
+        const dl = await downloadToTemp(u, 'img');
+        if (dl) return dl;
+      }
+    } catch { /* 换下一个 */ }
+  }
+
+  if (directUrl) {
+    const dl = await downloadToTemp(directUrl, 'img');
+    if (dl) return dl;
+  }
+  return null;
+}
+
 async function describeIncomingImages(bot, ev, key) {
   if (cfg_cache.vision === false) return;
   const segs = ev.message;
@@ -705,9 +756,8 @@ async function describeIncomingImages(bot, ev, key) {
     // 和视频一样：看图也要先腾显存，否则视觉模型加载会失败
     await Vram.prepareForVision(cfg_cache.cfg || {}, log);
 
-    const r = await bot.call('get_image', { file }, 30000);
-    const local = r?.file;
-    if (!local || !existsSync(local)) {
+    const local = await fetchImageFile(bot, ev, seg, file);
+    if (!local) {
       log('  👁 图片拿不到本地路径，跳过识别');
       return;
     }
