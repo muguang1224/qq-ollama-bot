@@ -32,6 +32,8 @@ import * as Stickers from './stickers.mjs';
 import * as Video from './video.mjs';
 import * as Qzone from './qzone.mjs';
 import * as TTS from './tts.mjs';
+import * as Search from './search.mjs';
+import * as Douyin from './douyin.mjs';
 
 // ---------------------------------------------------------------- 配置
 
@@ -108,6 +110,7 @@ const EXAMPLE = {
   },
   qzone: { ...Qzone.QZONE_DEFAULTS },
   tts: { ...TTS.TTS_DEFAULTS },
+  search: { ...Search.SEARCH_DEFAULTS },
 };
 
 function loadConfig() {
@@ -133,6 +136,7 @@ function loadConfig() {
     audio: { enabled: true, ...(raw.audio || {}) },
     qzone: { ...Qzone.QZONE_DEFAULTS, ...(raw.qzone || {}) },
     tts: { ...TTS.TTS_DEFAULTS, ...(raw.tts || {}) },
+    search: { ...Search.SEARCH_DEFAULTS, ...(raw.search || {}) },
   };
 }
 
@@ -1028,6 +1032,147 @@ async function maybeSendVoice(bot, ev, emoRec, reply) {
   }
 }
 
+// ---------------------------------------------------------------- 联网搜索
+
+/**
+ * 决定这次要不要联网搜，以及搜什么词。
+ *
+ * 两种触发：
+ *   1. 明确要求（「搜一下XX」「查一下XX」）—— 直接搜，不问模型，省一次调用
+ *   2. 模型自主判断（AutoSearch）—— 问一次模型：这句需要实时信息吗？
+ *
+ * 为什么让模型判断而不是关键词硬匹配：
+ *   「今天有什么新闻」该搜，「我今天好累」不该搜 —— 两者都没有"搜"字，
+ *   硬匹配要么漏要么误伤。
+ *
+ * @returns {Promise<{need:boolean, query?:string}>}
+ */
+async function decideSearch(text, cfg) {
+  const sc = cfg.search || {};
+  if (sc.enabled !== true) return { need: false };
+
+  // 快速路径：明确要求
+  if (Search.isSearchRequest(text)) {
+    const q = Search.extractQuery(text);
+    if (q) return { need: true, query: q };
+  }
+
+  if (sc.autoSearch === false) return { need: false };
+
+  // 让模型判断
+  try {
+    const out = await ollamaChat(Search.needSearchPrompt(text, PERSONA), {
+      ...cfg,
+      reply: { ...cfg.reply, maxTokens: 80, temperature: 0.2 },
+    });
+    const m = String(out || '').match(/\{[\s\S]*\}/);
+    if (!m) return { need: false };
+    const j = JSON.parse(m[0]);
+    const q = String(j.query || '').trim().slice(0, 30);
+    if (j.need && q) return { need: true, query: q };
+  } catch (e) {
+    log('  🔍 搜索判断失败: ' + e.message);
+  }
+  return { need: false };
+}
+
+/**
+ * 执行搜索，返回给模型看的文本。失败返回 null（就当没搜，不打断对话）。
+ */
+async function runSearch(query, cfg) {
+  const r = await Search.search(query, cfg);
+  if (!r.ok) {
+    log('  🔍 搜索失败（' + query + '）: ' + r.error);
+    return null;
+  }
+  log('  🔍 已搜索「' + query + '」→ ' + r.results.length + ' 条' + (r.cached ? '（缓存）' : ''));
+  return Search.format(r.results);
+}
+
+/**
+ * 判断对方是不是在要求发语音。
+ *
+ * 和「发个空间」一样，用户说了就该真发，而不是等 15% 的随机概率 ——
+ * 之前出现过用户说「你发条语音」，机器人回「我又不会变声器」的尴尬情况。
+ */
+function isVoiceRequest(text) {
+  const s = String(text || '');
+  // 提到"语音/声音/说句话"这类词
+  const hasVoice = /语音|声音|声线|说句话|说一句|讲句话|开口|出声/.test(s);
+  if (!hasVoice) return false;
+  // 否定式不算（"你发不了语音吧"）—— 但「能发吗/可以发吗」是询问，
+  // 用户问就是在要，所以不拦。
+  if (/(发不了|发不出|不会发|没法发|不能发|怎么发|如何发)/.test(s)) return false;
+  // 要有请求或询问意味
+  return /发|打|来一|说一|讲一|整一|弄一|听听|让我听|试试|你会|你能|可以|能发/.test(s);
+}
+
+/**
+ * 按对方要求发一条语音（不走随机概率）。
+ *
+ * @param {string} speak 要说的内容；空则由模型生成一句
+ * @returns {Promise<{ok:boolean, reply:string}>}
+ */
+async function sendVoiceOnDemand(bot, ev, emoRec, speak) {
+  const tc = cfg_cache.tts || {};
+  if (tc.enabled !== true) {
+    return { ok: false, reply: '我这边语音没开着呀' };
+  }
+
+  // 冷却：防连点
+  const key = String(ev.message_type === 'group' ? 'g:' + ev.group_id : 'p:' + ev.user_id);
+  const cd = 8000;
+  const last = lastVoiceAt.get(key) || 0;
+  if (Date.now() - last < cd) {
+    return { ok: false, reply: '刚发过呀 等会儿再给你说' };
+  }
+
+  let text = String(speak || '').trim();
+  if (!text) {
+    // 没指定内容 -> 让模型说一句短的
+    try {
+      const sys = PERSONA + '\n\n【当前任务】对方让你发条语音。说一句简短自然的话（15 字以内），只输出要说的内容。';
+      const out = await ollamaChat(
+        [{ role: 'system', content: sys }, { role: 'user', content: '（发条语音）' }],
+        { ...cfg_cache.cfg, reply: { ...cfg_cache.cfg.reply, maxTokens: 40 } }
+      );
+      text = sanitize(out, {
+        isOwner: !!cfg_cache.cfg?.bot?.owner &&
+                 String(ev.user_id) === String(cfg_cache.cfg.bot.owner),
+        ownerName: cfg_cache.cfg?.bot?.ownerName || '爸爸',
+        isGroup: ev.message_type === 'group',
+      });
+    } catch (e) {
+      return { ok: false, reply: '我想不出说什么呀' };
+    }
+  }
+  if (!text) return { ok: false, reply: '我想不出说什么呀' };
+
+  // 太长的截断（语音合成慢）
+  const maxChars = tc.maxChars ?? 60;
+  if (text.length > maxChars) text = text.slice(0, maxChars);
+
+  const t0 = Date.now();
+  const r = await TTS.synthesize(text, cfg_cache.cfg);
+  if (!r.ok) {
+    log('  🎤 按需发语音失败: ' + r.error);
+    return { ok: false, reply: '我这边声音出了点问题呀 晚点再试' };
+  }
+
+  try {
+    const msg = [{ type: 'record', data: { file: r.fileUrl } }];
+    if (ev.message_type === 'group') await bot.call('send_group_msg', { group_id: ev.group_id, message: msg }, 60000);
+    else await bot.call('send_private_msg', { user_id: ev.user_id, message: msg }, 60000);
+    lastVoiceAt.set(key, Date.now());
+    log('  🎤 按需语音已发（' + ((Date.now() - t0) / 1000).toFixed(1) + 's, ' + r.engine + '）: ' + text);
+    try { TTS.cleanupCache(30); } catch {}
+    return { ok: true, reply: '' };   // 语音本身就是回复，不用再打字
+  } catch (e) {
+    log('  🎤 按需发语音失败: ' + e.message);
+    return { ok: false, reply: '发出去好像失败了呀' };
+  }
+}
+
 /**
  * 让模型从候选表情里挑一张。
  *
@@ -1634,12 +1779,19 @@ async function main() {
   }
 
   // 把配置接进模块级缓存
+  // ⚠️ 新增配置段时一定要在这里补一行 —— maybeSendVoice / sendVoiceOnDemand
+  // 读的是 cfg_cache.tts，漏了这行它们就永远认为功能没开（真出过这个 bug：
+  // 启动日志显示"发语音已开启"，但用户说"发条语音"时它回"我这边语音没开着呀"）。
   cfg_cache.stickerCollect = cfg.stickers?.enabled !== false;
   cfg_cache.stickers = cfg.stickers || {};
   cfg_cache.vision = cfg.vision?.enabled !== false;
   cfg_cache.followUp = cfg.followUp || {};
   cfg_cache.video = cfg.video || {};
   cfg_cache.audio = cfg.audio || {};
+  cfg_cache.qzone = cfg.qzone || {};
+  cfg_cache.tts = cfg.tts || {};
+  cfg_cache.search = cfg.search || {};
+  cfg_cache.douyin = cfg.douyin || {};
   cfg_cache.cfg = cfg;
 
   log('='.repeat(56));
@@ -1786,6 +1938,31 @@ async function main() {
       }
     }
 
+    // —— 按需发语音 ——
+    // 用户说「你发条语音」「说句话听听」时，真的发一条语音条。
+    // 之前没有这个分支，机器人只会打字拒绝（"我又不会变声器"），很尴尬。
+    if (isVoiceRequest(text)) {
+      lastReplyAt.set(key, Date.now());
+      log('收到 [' + (ev.message_type === 'group' ? '群' + ev.group_id : '私聊') + '] ' +
+          (ev.sender?.card || ev.sender?.nickname || ev.user_id) + ' 要求发语音: ' + text);
+
+      const emoRec = Emo.load(key);
+      // 把"发条语音说我今天很开心"里的内容部分抠出来当台词
+      const speak = text
+        .replace(/你|帮我|给我|能不能|可以|一下|一条|一个|呗|吧|呀|啊/g, ' ')
+        .replace(/发|来|说|讲|整|弄|试试|听听|让我听|语音|声音|声线|句话|一句/g, ' ')
+        .replace(/[，,。！!？?、\s]+/g, ' ').trim();
+
+      const r = await sendVoiceOnDemand(bot, ev, emoRec, speak.length >= 2 ? speak : '');
+      if (!r.ok && r.reply) {
+        remember(key, 'assistant', r.reply, cfg.reply.contextTurns);
+        if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, r.reply);
+        else await bot.sendPrivate(ev.user_id, r.reply);
+        log('  回复: ' + r.reply);
+      }
+      return;
+    }
+
     // —— 按需发空间 ——
     // 用户说「发个空间」「帮我发条说说」时，真的发一条（不是只答应）。
     // 放在冷却之后，避免和普通回复抢。
@@ -1848,8 +2025,51 @@ async function main() {
       const rec = Mem.load(key);
       // 情绪状态也拼进去 —— 让数值真的影响说话
       const emoRec = Emo.load(key);
-      const systemPrompt = PERSONA + renderMemory(rec, cfg, ev.user_id) +
+      let systemPrompt = PERSONA + renderMemory(rec, cfg, ev.user_id) +
         (cfg.emotion?.enabled !== false ? Emo.render(emoRec) : '');
+
+      // —— 联网搜索 ——
+      // 需要实时信息时先搜，把结果塞进 system prompt 再让模型回答。
+      // 这样模型说的是真实查到的内容，不是编的。
+      let searchNote = '';
+      if (cfg.search?.enabled === true) {
+        const d = await decideSearch(text, cfg);
+        if (d.need && d.query) {
+          const ctx = await runSearch(d.query, cfg);
+          if (ctx) {
+            systemPrompt += '\n\n【联网搜到的资料（刚查的，可以用）】\n' + ctx +
+              '\n\n（这是真实搜索结果。用它来回答，但别念标题、别说"根据搜索结果"，' +
+              '像自己知道一样自然说出来。资料里没有的就别编。）';
+            searchNote = d.query;
+          }
+        }
+      }
+
+      // —— 抖音链接 ——
+      // 抖音反爬是字节码级的（实测：视频页只返回空壳 JS，
+      // oembed 返回空 body，第三方 API 已失效），只能尽力从分享页取标题。
+      // 取到就写进上下文当谈资；取不到就把真实情况告诉模型，
+      // 让它自然地说"打不开"，并提示对方直接发视频文件过来 ——
+      // 后者是可靠的，本地视频能力是通的。
+      if (cfg.douyin?.enabled !== false) {
+        const dyLink = Douyin.findDouyinLink(text);
+        if (dyLink) {
+          log('  📱 检测到抖音链接: ' + dyLink.slice(0, 50));
+          const dy = await Douyin.parse(dyLink, cfg);
+          if (dy.ok) {
+            log('  📱 拿到文案: ' + String(dy.title).slice(0, 50));
+            systemPrompt += '\n\n【对方发的抖音，你看到的信息】\n' +
+              String(dy.title).slice(0, 300) +
+              '\n\n（这是从抖音分享页拿到的真实文案。围绕它自然聊，别说是"抓取"来的。）';
+          } else {
+            log('  📱 拿不到文案: ' + (dy.error || ''));
+            systemPrompt += '\n\n【对方发了个抖音链接，但你打不开】\n' +
+              '（真实原因：抖音的反爬挡住了，你只能拿到标题，这次连标题都没拿到。）\n' +
+              '你要坦率说打不开 —— 别说"我看过了"，那是撒谎。\n' +
+              '可以顺口说一句：你直接把视频下下来发我，我能看。';
+          }
+        }
+      }
 
       // 取上下文：不包括"刚存进去的这条"（下面会单独作为 user 消息传入）
       //
@@ -1945,6 +2165,31 @@ async function main() {
   // QQ空间自动发说说
   startQzone(bot, cfg);
 
+  // —— 配置缓存自检 ——
+  // 踩过的坑：新增了 config 段，但忘了往 cfg_cache 里搬，
+  // 导致启动日志说"已开启"、运行时却当成"没开"（语音功能就这么坏了半天）。
+  // 这里逐项核对，任何一项对不上就在启动阶段直接报出来。
+  {
+    const checks = [
+      ['stickers', cfg.stickers],
+      ['vision', cfg.vision],
+      ['followUp', cfg.followUp],
+      ['video', cfg.video],
+      ['audio', cfg.audio],
+      ['qzone', cfg.qzone],
+      ['tts', cfg.tts],
+      ['search', cfg.search],
+      ['douyin', cfg.douyin],
+    ];
+    const missing = checks
+      .filter(([k, v]) => v !== undefined && cfg_cache[k] === undefined)
+      .map(([k]) => k);
+    if (missing.length) {
+      log('⚠️ 配置缓存缺失: ' + missing.join(', ') +
+          ' —— 相关功能会误判为未开启，请检查 main() 里的 cfg_cache 赋值');
+    }
+  }
+
   // 语音合成状态
   {
     const tc = cfg.tts || {};
@@ -1970,6 +2215,28 @@ async function main() {
             '，概率 ' + Math.round((tc.chance ?? 0.15) * 100) + '%' +
             '，冷却 ' + (tc.cooldownMin ?? 30) + ' 分钟');
       }
+    }
+  }
+
+  // 联网搜索状态
+  {
+    const sc = cfg.search || {};
+    if (sc.enabled !== true) {
+      log('联网搜索：未开启（config.json 的 search.enabled）');
+    } else {
+      log('联网搜索：已开启，引擎 ' + (sc.engine || 'bing') +
+          (sc.autoSearch !== false ? '，它自己判断何时搜' : '，仅你说"搜一下"时搜'));
+    }
+  }
+
+  // 抖音解析状态
+  {
+    const dc = cfg.douyin || {};
+    if (dc.enabled === false) {
+      log('抖音解析：未开启');
+    } else {
+      log('抖音解析：已开启（注意：抖音反爬很严，只能尽力取标题，' +
+          '取不到会说打不开；发视频文件给它看是可靠的）');
     }
   }
 
