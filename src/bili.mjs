@@ -182,6 +182,30 @@ export function findBiliLink(text) {
   return null;
 }
 
+/** 短链跳转拿真实地址（b23.tv → bilibili.com/video/BVxxx） */
+export async function resolveShort(shortUrl, cfg) {
+  const c = { ...BILI_DEFAULTS, ...(cfg?.bili || {}) };
+  return new Promise((resolve) => {
+    const curl = which('curl') || 'curl';
+    // -I 只取响应头；--ssl-no-revoke 同理（国内必须）
+    execFile(curl, [
+      '-s', '-I', '-L', '--ssl-no-revoke',
+      '-H', 'User-Agent: ' + UA,
+      '--max-time', String(Math.ceil((c.timeoutMs || 20000) / 1000)),
+      '-o', '-', '-w', '%{url_effective}',
+      shortUrl,
+    ], execOpts({ timeout: (c.timeoutMs || 20000) + 5000 }), (err, stdout) => {
+      const t = String(stdout || '').trim();
+      if (!t) return resolve(null);
+      // -w 输出的是最后一行的最终 URL
+      const lines = t.split('\n').map((x) => x.trim()).filter(Boolean);
+      const finalUrl = lines[lines.length - 1] || '';
+      const m = /(BV[0-9A-Za-z]{10})/.exec(finalUrl);
+      resolve(m ? m[1] : (finalUrl || null));
+    });
+  });
+}
+
 /** 判断是不是在要求看 B 站 */
 export function isBiliRequest(text) {
   const s = String(text || '');

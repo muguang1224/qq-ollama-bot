@@ -444,6 +444,69 @@ function isAtMe(ev, selfId) {
   );
 }
 
+// ---------------------------------------------------------------- 卡片解析
+
+/**
+ * 从 QQ 卡片消息（json / xml）里尽量抠出可读信息。
+ *
+ * 卡片结构五花八门，各平台（B站/网易云/QQ音乐/公众号）都不一样，
+ * 所以策略是「按优先级找几个常见字段，找到就用，找不到就退回原文裁一段」。
+ *
+ * 典型 B站卡片长这样：
+ *   {"app":"com.tencent.structmsg","meta":{"news":{
+ *      "title":"【标题】","desc":"...","jumpUrl":"https://b23.tv/xxx"}}}
+ *
+ * @returns {string} 拼接好的可读文本，失败返回 ''
+ */
+function extractCard(seg) {
+  const raw = seg.data?.data || seg.data?.text || '';
+  if (!raw) return '';
+
+  let obj = null;
+  try { obj = JSON.parse(raw); } catch { /* xml 或非 JSON，走下面的正则 */ }
+
+  const parts = [];
+  const add = (v) => {
+    const s = String(v || '').trim();
+    if (!s || s.length > 150) return;
+    if (parts.some((x) => x.includes(s))) return;
+    parts.push(s);
+  };
+
+  if (obj && typeof obj === 'object') {
+    const meta = obj.meta || {};
+    for (const key of Object.keys(meta)) {
+      const m = meta[key];
+      if (!m || typeof m !== 'object') continue;
+      const t = String(m.title || '').trim();
+      if (t && t.length <= 120) add('《' + t + '》');
+      add(m.desc);
+      // 链接字段名各平台不同
+      add(m.jumpUrl || m.url || m.qqdocurl || m.sourceUrl || m.musicUrl);
+      if (m.tag) add('[' + m.tag + ']');
+    }
+    add(obj.prompt);
+  }
+
+  // 从原始字符串里兜底找链接（XML 也能覆盖）
+  if (!parts.some((x) => /^https?:\/\//.test(x))) {
+    const u = /https?:\/\/[^\s"'<>\\]+/.exec(raw);
+    if (u) add(u[0].replace(/\\\//g, '/'));
+  }
+  if (!parts.length) {
+    const t = /"title"\s*:\s*"([^"]{2,80})"/.exec(raw);
+    if (t) add('《' + t[1] + '》');
+  }
+
+  // 还是空就退回原文（裁一段，去掉转义符）
+  if (!parts.length) {
+    const cut = raw.replace(/\\\//g, '/').replace(/\\n/g, ' ').slice(0, 200);
+    return cut ? '[卡片:' + cut + ']' : '';
+  }
+
+  return '[卡片] ' + parts.join(' ');
+}
+
 /** 把消息段数组转成纯文本 */
 function plainText(ev) {
   const segs = ev.message;
@@ -463,7 +526,16 @@ function plainText(ev) {
       if (s.type === 'record') return '[语音]';
       if (s.type === 'video') return '[视频]';
       if (s.type === 'file') return '[文件:' + (s.data?.name || s.data?.file || '') + ']';
-      if (s.type === 'json' || s.type === 'xml') return '[卡片消息]';
+      // 卡片消息（json/xml）
+      //
+      // 原来直接返回 '[卡片消息]'，等于把内容全丢了。
+      // 而 B站/网易云 这类分享卡片里其实带着标题和链接 ——
+      // 丢掉之后就变成"收到卡片啦 是什么内容呀 给我看看"这种答非所问。
+      // 这里尽量把可读信息抠出来。
+      if (s.type === 'json' || s.type === 'xml') {
+        const txt = extractCard(s);
+        return txt || '[卡片消息]';
+      }
       if (s.type === 'forward' || s.type === 'node') return '[聊天记录]';
       if (s.type === 'poke') return '[戳一戳]';
       if (s.type === 'reply') return '';
@@ -2243,7 +2315,14 @@ async function main() {
         if (bl) {
           log('  📺 检测到 B 站链接: ' + bl.type + ' ' + bl.id);
           let info = null;
-          if (bl.type === 'bvid') info = await Bili.videoInfo(bl.id, cfg);
+          if (bl.type === 'bvid') {
+            info = await Bili.videoInfo(bl.id, cfg);
+          } else if (bl.type === 'short') {
+            // b23.tv 短链要先跳转才知道是哪个视频
+            const bv = await Bili.resolveShort(bl.id, cfg);
+            log('  📺 短链解析 → ' + (bv || '失败'));
+            if (bv && /^BV/.test(bv)) info = await Bili.videoInfo(bv, cfg);
+          }
           if (info && info.ok) {
             log('  📺 拿到视频信息: ' + info.video.title.slice(0, 40));
             systemPrompt += '\n\n【对方发的 B 站视频，你查到的真实信息】\n' +
