@@ -14,6 +14,19 @@ import { createHash } from 'node:crypto';
 import { ROOT } from './paths.mjs';
 import { which, execOpts } from './platform.mjs';
 
+/**
+ * 节流日志：同一条消息 60 秒内只打一次。
+ * stickers.mjs 里没有 bridge 的 log，但降级重试这类事件必须留痕，
+ * 又不想在批量标注时刷屏。
+ */
+let _lastLog = { msg: '', at: 0 };
+function logOnce(msg) {
+  const now = Date.now();
+  if (msg === _lastLog.msg && now - _lastLog.at < 60000) return;
+  _lastLog = { msg, at: now };
+  console.log(msg);
+}
+
 export const STICKER_DIR = join(ROOT, 'stickers');
 export const INDEX_FILE = join(STICKER_DIR, 'index.json');
 export const SEEN_FILE = join(STICKER_DIR, '.seen.json');
@@ -46,6 +59,8 @@ Do not explain. Do not use markdown.`;
  */
 export async function describe(filePath, cfg, timeoutMs = 90000) {
   const model = cfg.vision?.model || 'qwen2.5vl:3b';
+  // qwen 系中文好、moondream 只认英文 —— 提示词和缩放尺寸都要按它区分
+  const isQwen = /qwen/i.test(model);
   let imgBuf = null;
 
   // 关键：用魔数判断真实格式，不能信扩展名。
@@ -71,21 +86,32 @@ export async function describe(filePath, cfg, timeoutMs = 90000) {
     if (!imgBuf) throw new Error('无法识别的图片格式');
   }
 
-  // —— 关键：把图缩到 256px 再送模型 ——
+  // —— 缩放尺寸：要按模型区分 ——
   //
-  // 实测（Ollama 0.24.0 + qwen2.5vl:3b）：
+  // 256px 这个值是给 qwen2.5vl:3b 调的：
   //   原图（148KB JPEG）直接送 → 46~200 秒，甚至 "Failed to create new sequence"
   //   缩到 256px（18KB）        → 4.4 秒，稳定成功
-  //   64px 更快（1.5s）但细节丢失，256px 是速度和质量的最佳点
-  imgBuf = shrinkForVision(imgBuf, cfg?.vision?.maxPx || 256);
+  //
+  // 但换成 moondream 后 256px 会翻车 —— 实测同一帧：
+  //   256px (5.3KB) → "三月日普通山阿福城市大阿山山山山山山山"   纯乱码
+  //   384px (9.6KB) → "a female anime character with red hair..."  正常
+  //   512px (14KB)  → 同上，稳定
+  // moondream 的视觉编码器需要更多像素才认得出东西。
+  const defaultPx = isQwen ? 256 : 448;
+  imgBuf = shrinkForVision(imgBuf, cfg?.vision?.maxPx || defaultPx);
 
   const b64 = imgBuf.toString('base64');
 
-  // qwen 系用中文提示词；llava 中文很弱，用英文
-  const isQwen = /qwen/i.test(model);
+  // qwen 系用中文提示词；moondream 只认英文，用英文
   const prompt = isQwen
-    ? '用中文简短描述这张表情包：画的是什么？什么情绪？不超过25字，直接说，不要解释。'
-    : VISION_PROMPT;
+    ? '用中文简短描述这张图：画的是什么？不超过25字，直接说，不要解释。'
+    // moondream 实测有两个毛病：
+    //   ① 不加约束时会输出 "中国人类型 xxx" 这种中英混搭前缀
+    //   ② 有时会瞎猜（把白发动漫少女说成 "ikebana, traditional Japanese art"）
+    // 所以明确要求：只用英文、只描述看到的、别猜。
+    : 'Describe only what is literally visible in this image, in English. ' +
+      'Start directly with the subject. Do not add labels, categories, or ' +
+      'guesses. Under 20 words.';
 
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
@@ -100,9 +126,67 @@ export async function describe(filePath, cfg, timeoutMs = 90000) {
         images: [b64],
         stream: false,
         options: { num_predict: 80, temperature: 0.2 },
+        // keep_alive：视觉模型跑完就尽快退出内存。
+        //
+        // 背景：聊天模型 qwen3.5-4b（2.55GB）+ 视觉模型 qwen2.5vl:3b（2.98GB），
+        // Ollama 默认让模型驻留 5 分钟，切换时两个同时占内存，于是报
+        //   "model requires more system memory (9.5 GiB) than is available"
+        // 传一个很短的存活时间，用完就释放，把内存让给聊天模型。
+        // 代价：下次看图要重新加载（2-3 秒）；换来的是不再内存不足。
+        // keep_alive 的取值是个权衡：
+//
+//   太短（10s）：模型用完就卸载，下次看图要重新加载 ——
+//                实测首次推理 82 秒，而且频繁 load/unload 过程中
+//                内存峰值更高，反而容易触发 "requires more memory"。
+//   太长（5m） ：和聊天模型（qwen3.5-4b）同时驻留，两个加起来
+//                约 5.5GB，16GB 内存的机器会紧张。
+//
+// 折中：给 2 分钟。一轮对话里的连续看图能复用已加载的模型，
+// 停下来两分钟后自动释放，不会长期占着。
+keep_alive: cfg.vision?.keepAlive || '2m',
+        // num_ctx：限制上下文长度，能显著降低 KV cache 的内存占用。
+        //
+        // qwen2.5vl 声明的 context_length 是 128000，Ollama 会按这个预分配，
+        // 于是单是 KV cache 就要好几个 GB。看图这个任务根本用不上长上下文
+        // （一张图 + 一句提示词），给 2048 绰绰有余。
+        num_ctx: cfg.vision?.numCtx || 2048,
       }),
     });
-    const j = await r.json();
+    let j = await r.json();
+
+    // —— 内存不足时的降级重试 ——
+    //
+    // 16GB 内存的机器上，Ollama 经常差那么一点点：
+    //   "model requires more system memory (10.1 GiB) than is available (10.0 GiB)"
+    // 差 0.1GB 就整个失败太可惜了。所以：先把别的模型卸掉，
+    // 再把图缩得更小重试一次 —— 小图需要的 workspace 更少。
+    if (j.error && /memory/i.test(j.error)) {
+      logOnce('  🖼 内存不足，降级重试: ' + String(j.error).slice(0, 60));
+      try {
+        // 把聊天模型请出内存，给视觉模型腾地方
+        await fetch((cfg.ollama?.baseUrl || 'http://127.0.0.1:11434') + '/api/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: cfg.ollama?.model || 'qwen3.5-4b', keep_alive: 0 }),
+        });
+      } catch {}
+
+      const smaller = shrinkForVision(imgBuf, 192);
+      const r2 = await fetch((cfg.ollama?.baseUrl || 'http://127.0.0.1:11434') + '/api/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          prompt,
+          images: [smaller.toString('base64')],
+          stream: false,
+          keep_alive: cfg.vision?.keepAlive || '2m',
+          options: { num_predict: 80, temperature: 0.2, num_ctx: cfg.vision?.numCtx || 2048 },
+        }),
+      });
+      j = await r2.json();
+    }
+
     if (j.error) throw new Error(j.error);
 
     const raw = (j.response || '').trim().replace(/\s+/g, ' ');
@@ -110,16 +194,152 @@ export async function describe(filePath, cfg, timeoutMs = 90000) {
     if (isQwen) {
       return { visual: raw.slice(0, 80), emotion: guessEmotionCn(raw), raw };
     }
-    const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
-    let visual = raw.slice(0, 80);
+
+    // —— 非 qwen 模型（目前是 moondream）——
+    //
+    // moondream 只认英文，输出也是英文，而且实测会跑偏
+    // （把白发动漫少女说成 "ikebana, a traditional Japanese art form"）。
+    // 所以：
+    //   ① 提示词改成纯描述任务，别让它发挥
+    //   ② 拿到英文后翻译成中文再入库（用聊天模型翻，成本很低）
+    let visual = raw.slice(0, 120);
     let emotion = '';
-    if (parts.length >= 2) {
-      emotion = parts[parts.length - 1].slice(0, 20);
-      visual = parts.slice(0, -1).join(', ').slice(0, 80);
+
+    // 试英文情绪
+    const en = raw.toLowerCase();
+    if (/\b(smil|happy|joy|cheer|glad|laugh)/.test(en)) emotion = '开心';
+    else if (/\b(sad|cry|tear|unhappy|sorrow)/.test(en)) emotion = '难过';
+    else if (/\b(angry|anger|rage|furious)/.test(en)) emotion = '生气';
+    else if (/\b(surpris|shock|amaz|astonish)/.test(en)) emotion = '惊讶';
+    else if (/\b(confus|puzzl|wonder)/.test(en)) emotion = '困惑';
+    else if (/\b(calm|serene|peace|quiet|neutral)/.test(en)) emotion = '平静';
+    else if (/\b(fear|scared|afraid|anxious)/.test(en)) emotion = '害怕';
+
+    // 翻成中文（失败就用原文）
+    const zh = await translateToZh(raw, cfg);
+    if (zh) {
+      visual = zh.slice(0, 80);
+    } else {
+      // 翻译失败（或原文被判为乱码）-> 直接丢掉这次识别结果。
+      //
+      // 原来这里是 "保留英文原文兜底"，但实测 moondream 的输出经常带
+      // "中国人类型" 这种幻觉前缀、甚至整句乱码，保留下来会让机器人
+      // 拿它当"看到的内容"去聊，比"没看到"糟得多。
+      // 所以宁可返回空，让调用方当作识别失败处理。
+      return { visual: '', emotion, raw, failed: true };
     }
+
     return { visual, emotion, raw };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/**
+ * 判断一段中文描述是不是"像人话"。
+ *
+ * 为什么要这个：moondream 偶尔会吐纯乱码，例如
+ *   "中央部案防署器类型无穷大约3.5m"
+ *   "中国人类型日期3468389844"
+ * 这些如果直接入库，机器人就会拿它当"看到的内容"聊，非常离谱。
+ *
+ * 判定思路（都是实测里出现过的特征）：
+ *   · 含连续数字串（日期/编号）—— 正常图像描述不会有 "3468389844"
+ *   · 含"类型""大约"这类模板词密集堆叠
+ *   · 中文虚词（的/是/在/有/一个/穿着/颜色）几乎没有 —— 真人描述一定会用
+ *   · 开头是"中国人类型"这种中英混搭模板
+ */
+function looksLikeGarbage(s) {
+  const t = String(s || '').trim();
+  if (!t) return true;
+  if (t.length < 4) return true;
+
+  // 连续 6 位以上数字
+  if (/\d{6,}/.test(t)) return true;
+  // 明显的模板/幻觉词
+  if (/类型|大约\d|无穷|日期\d|无频|无预测/.test(t)) return true;
+
+  // —— moondream 乱码的典型特征：整句中文但没有一个实义词 ——
+  // 例："三月日普通山阿福城市大阿山山山山山山山"
+  //     "龙山萬灌阿清洛山萬灌阿清洛山萬灌阿"
+  // 正常的图像描述一定会出现这些词之一（人/角色/女/男/画/背景/穿/站/表情…）
+  const zh = t.match(/[\u4e00-\u9fa5]/g) || [];
+  if (zh.length >= 4) {
+    const hasContent = /[人女男角色画背景穿着站坐躺表情脸头发眼睛看手持天空城市房间风景猫狗动漫图]/.test(t);
+    if (!hasContent) return true;
+    // 同一个字重复 3 次以上（"山山山山"）也是乱码特征
+    if (/(.)\1{2,}/.test(t.replace(/\s/g, ''))) return true;
+  }
+
+  // 中英混杂且不是正常的专名（如"anime"）
+  if (/[\u4e00-\u9fa5]/.test(t) && /[a-z]{3,}/.test(t) && !/anime|cosplay|jk|mv/i.test(t)) {
+    const ratio = zh.length / t.length;
+    if (ratio > 0.3) return true;
+  }
+  return false;
+}
+
+/**
+ * 把英文描述翻成中文。用聊天模型，一次几十毫秒。
+ * 失败就返回空串，调用方用原文兜底 —— 绝不因为翻译失败而丢掉识别结果。
+ */
+async function translateToZh(text, cfg) {
+  let t = String(text || '').trim();
+  if (!t) return '';
+
+  // —— 清理 moondream 的噪声 ——
+  // 实测它的原始输出会混进一些奇怪东西：
+  //   "!!!IMAGE!!! The image shows..."   ← 特殊标记
+  //   "中国人类型 female character with..."  ← 中英混杂的幻觉碎片
+  //   "中央部案防署器类型无穷大约3.5m"      ← 纯乱码
+  // 所以先剥掉标记和开头的怪词，剩下看不懂的就判定为失败。
+  t = t.replace(/!{2,}\s*IMAGE\s*!{2,}/gi, ' ')
+       .replace(/^\s*(The image|This image|In this image)\s+(shows?|features?|depicts?|is)\s*/i, '')
+       // moondream 的系统性幻觉前缀。实测它反复吐出这些词：
+       //   "中国人类型 female character with..."   （类别标记）
+       //   "龙山, a female anime character..."      （地名）
+       //   "中国人类型日期无频时间无频无频..."        （纯乱码）
+       // 这些是模型自身的固定偏置，和画面无关，一律剥掉再判断。
+       .replace(/^[\u4e00-\u9fa5]{2,8}(类型|地区|省|市)\s*[,，]?\s*/, '')
+       .replace(/^(龙山|泰山|黄山|华山)\s*[,，]\s*/, '')
+       .replace(/\s+/g, ' ')
+       .trim();
+
+  // 已经基本是中文就不翻（但要先确认它像人话）
+  const zhRatio = (t.match(/[\u4e00-\u9fa5]/g) || []).length / Math.max(t.length, 1);
+  if (zhRatio > 0.5) {
+    return looksLikeGarbage(t) ? '' : t;
+  }
+
+  // 太短的英文描述没信息量
+  if (t.length < 8) return '';
+
+  try {
+    const r = await fetch((cfg.ollama?.baseUrl || 'http://127.0.0.1:11434') + '/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: cfg.ollama?.model || 'qwen3.5-4b',
+        prompt: '把下面这句英文翻成通顺的中文，只输出译文，不要解释、不要加引号：\n' + t.slice(0, 200),
+        stream: false,
+        keep_alive: '5m',
+        options: { num_predict: 80, temperature: 0.1 },
+      }),
+    });
+    const j = await r.json();
+    if (j.error) return '';
+    const out = String(j.response || '').trim().replace(/\s+/g, ' ');
+    const cleaned = out
+      .replace(/^(译文[:：]?|翻译[:：]?)/, '')
+      .replace(/^["「『]|["」』]$/g, '')
+      .trim();
+    // 译文里如果还有大段英文，说明翻译没成，丢掉
+    if (/[a-zA-Z]{6,}/.test(cleaned)) return '';
+    // 译文也要过一遍乱码检查 —— 翻出来的也可能是糊话
+    if (looksLikeGarbage(cleaned)) return '';
+    return cleaned;
+  } catch {
+    return '';
   }
 }
 

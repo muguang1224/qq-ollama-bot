@@ -732,19 +732,31 @@ async function fetchVideoFile(bot, ev, seg, file) {
   const isGroup = ev.message_type === 'group';
   const attempts = [];
 
-  // ① 正路：私聊/群 各自的 file_url 接口
+  // 视频消息段里可用的字段（SnowLuma 的 file_id 在段里叫 file）
+  const fileId = seg.data?.file_id || seg.data?.file || '';
+  // file_hash：SnowLuma 的说明是「必要时原样传」，
+  // 段里可能叫 file_hash / hash / md5
+  const fileHash = seg.data?.file_hash || seg.data?.hash || seg.data?.md5 || '';
+
+  // ① 正路：SnowLuma 文档里写的参数是 { user_id, file_id[, file_hash] }
   if (isGroup) {
-    attempts.push(['get_group_file_url', { group_id: ev.group_id, file_id: file }]);
-    attempts.push(['get_group_file_url', { group_id: ev.group_id, file }]);
+    attempts.push(['get_group_file_url', { group_id: ev.group_id, file_id: fileId }]);
+    if (fileHash) attempts.push(['get_group_file_url', { group_id: ev.group_id, file_id: fileId, file_hash: fileHash }]);
   } else {
-    attempts.push(['get_private_file_url', { user_id: ev.user_id, file_id: file }]);
-    attempts.push(['get_private_file_url', { user_id: ev.user_id, file }]);
+    attempts.push(['get_private_file_url', { user_id: ev.user_id, file_id: fileId }]);
+    if (fileHash) attempts.push(['get_private_file_url', { user_id: ev.user_id, file_id: fileId, file_hash: fileHash }]);
   }
 
-  // ② 兜底：get_file（对图片/语音有效，视频看后端实现）
-  attempts.push(['get_file', { file }]);
+  // ② 有些实现用 file 而不是 file_id
+  if (fileId) {
+    if (isGroup) attempts.push(['get_group_file_url', { group_id: ev.group_id, file: fileId }]);
+    else attempts.push(['get_private_file_url', { user_id: ev.user_id, file: fileId }]);
+  }
 
-  // ③ 有些实现直接给 url，那就下载
+  // ③ 兜底：get_file（对图片/语音有效，视频看后端实现）
+  if (file) attempts.push(['get_file', { file }]);
+
+  // ④ 有些实现直接给 url，那就下载
   const directUrl = seg.data?.url;
 
   for (const [action, params] of attempts) {
@@ -804,6 +816,11 @@ async function describeIncomingVideo(bot, ev, key) {
 
   try {
     log('  🎬 收到视频，正在取文件…');
+    // 把段里的字段打出来，方便定位接口参数该怎么传
+    // （SnowLuma 的 get_private_file_url 要 file_id，段里叫 file，
+    //   而且"必要时传 file_hash" —— 到底有没有，看日志最快）
+    log('  🎬 视频段字段: ' + JSON.stringify(seg.data || {}).slice(0, 300));
+
     const local = await fetchVideoFile(bot, ev, seg, file);
     if (!local) {
       log('  🎬 视频文件拿不到，跳过');
