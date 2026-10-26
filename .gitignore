@@ -32,6 +32,9 @@ bili/
 # 显存仲裁状态
 .vram-state.json
 
+# ASR 临时文件（音频/脚本）
+.asr-work/
+
 # 备份
 *.bak
 

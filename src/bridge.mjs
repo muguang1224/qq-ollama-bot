@@ -36,6 +36,7 @@ import * as Search from './search.mjs';
 import * as Douyin from './douyin.mjs';
 import * as Bili from './bili.mjs';
 import * as Vram from './vram.mjs';
+import * as Asr from './asr.mjs';
 
 // ---------------------------------------------------------------- 配置
 
@@ -115,6 +116,7 @@ const EXAMPLE = {
   search: { ...Search.SEARCH_DEFAULTS },
   bili: { ...Bili.BILI_DEFAULTS },
   vram: { autoFree: true, minFreeVramMB: 6000, waitMs: 4000 },
+  asr: { ...Asr.ASR_DEFAULTS },
 };
 
 function loadConfig() {
@@ -143,6 +145,7 @@ function loadConfig() {
     search: { ...Search.SEARCH_DEFAULTS, ...(raw.search || {}) },
     bili: { ...Bili.BILI_DEFAULTS, ...(raw.bili || {}) },
     vram: { autoFree: true, minFreeVramMB: 6000, waitMs: 4000, ...(raw.vram || {}) },
+    asr: { ...Asr.ASR_DEFAULTS, ...(raw.asr || {}) },
   };
 }
 
@@ -856,15 +859,39 @@ async function describeIncomingVideo(bot, ev, key) {
 
     log('  🎬 视频内容: ' + summary.slice(0, 70));
 
-    // 写进上下文
-    const note = Video.renderVideoNote({ duration, summary });
+    // —— 语音转文字 ——
+    // 视频信息有一半在声音里。只有画面时它能说"一个红发女孩"，
+    // 但不知道发生了什么；有了台词才谈得上"看懂"。
+    // 转录不占显存（CPU 跑），所以不用参与显存仲裁。
+    let asr = null;
+    if (cfg_cache.asr?.enabled !== false) {
+      try {
+        const t0 = Date.now();
+        log('  🎧 正在转写视频里的语音…');
+        asr = await Asr.transcribe(local, cfg_cache.cfg || {}, log);
+        if (asr.ok && asr.segments?.length) {
+          log('  🎧 转写完成（' + ((Date.now() - t0) / 1000).toFixed(0) + 's，' +
+              asr.segments.length + ' 段）: ' + asr.text.slice(0, 60));
+        } else if (asr.ok) {
+          log('  🎧 没有人声（可能是纯音乐）');
+        } else {
+          log('  🎧 转写失败: ' + asr.error);
+        }
+      } catch (e) {
+        log('  🎧 转写异常: ' + e.message);
+      }
+    }
+
+    // 写进上下文：画面 + 台词
+    const note = Video.renderVideoNote({ duration, summary }) +
+                 (asr?.ok ? Asr.renderTranscript(asr) : '');
     const hist = history(key);
     if (hist && hist.length) {
       const last = [...hist].reverse().find((m) => m.role === 'user');
       if (last) last.content = (last.content || '') + note;
       saveCtx(key, hist);
     }
-    return { summary, duration, parts };
+    return { summary, duration, parts, asr };
   } catch (e) {
     log('  🎬 视频处理出错: ' + e.message);
   }
@@ -2188,6 +2215,7 @@ async function main() {
   cfg_cache.douyin = cfg.douyin || {};
   cfg_cache.bili = cfg.bili || {};
   cfg_cache.vram = cfg.vram || {};
+  cfg_cache.asr = cfg.asr || {};
   cfg_cache.cfg = cfg;
 
   log('='.repeat(56));
@@ -2657,6 +2685,7 @@ async function main() {
       ['douyin', cfg.douyin],
       ['bili', cfg.bili],
       ['vram', cfg.vram],
+      ['asr', cfg.asr],
     ];
     const missing = checks
       .filter(([k, v]) => v !== undefined && cfg_cache[k] === undefined)
@@ -2738,6 +2767,20 @@ async function main() {
       const free = Vram.freeVramMB();
       log('显存仲裁：已开启，看图/视频前自动让 GPT-SoVITS 让位' +
           (free >= 0 ? '（当前显存空闲 ' + free + ' MB）' : ''));
+    }
+  }
+
+  // 语音转文字状态
+  {
+    const ac = cfg.asr || {};
+    if (ac.enabled === false) {
+      log('语音转文字：未开启');
+    } else if (!ac.pythonPath || !existsSync(ac.pythonPath)) {
+      log('⚠️ 语音转文字：找不到 python（' + (ac.pythonPath || '未配置') +
+          '），视频只会看画面、听不到台词');
+    } else {
+      log('语音转文字：已开启，模型 ' + (ac.model || 'medium') +
+          '（CPU 转写，视频会连台词一起理解）');
     }
   }
 
