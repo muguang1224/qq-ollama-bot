@@ -203,7 +203,7 @@ function memKey(ev) {
 }
 
 /** 记录一条消息（别人的，或机器人自己的） */
-function remember(key, role, content, keepTurns) {
+function remember(key, role, content, keepTurns, fromQQ) {
   let arr = memory.get(key);
   if (!arr) {
     // 首次访问这个会话：先从磁盘恢复（重启后不会失忆）
@@ -212,7 +212,12 @@ function remember(key, role, content, keepTurns) {
     if (memory.size >= MEM_LIMIT) memory.delete(memory.keys().next().value);
     memory.set(key, arr);
   }
-  arr.push({ role, content });
+  // fromQQ：群聊里这条是谁说的。
+  // 必须存下来 —— 否则提炼群档案时只看到一堆「对方：」，
+  // 模型会把 A 的喜好记到 B 头上。
+  const item = { role, content };
+  if (fromQQ) item.fromQQ = String(fromQQ);
+  arr.push(item);
   // 只保留最近 N 轮（1 轮 = user + assistant）
   const max = (keepTurns || 10) * 2;
   if (arr.length > max) arr.splice(0, arr.length - max);
@@ -451,7 +456,9 @@ function inGroupSession(groupId, cfg) {
 
 /** 进入/续期对话状态 */
 function touchGroupSession(groupId, cfg) {
-  const ms = cfg.reply?.groupSessionMs ?? GROUP_SESSION_MS_DEFAULT;
+  // 支持两种写法：新的 reply.groupSession.windowMs，和旧的 reply.groupSessionMs
+  const gs = cfg.reply?.groupSession || {};
+  const ms = gs.windowMs ?? cfg.reply?.groupSessionMs ?? GROUP_SESSION_MS_DEFAULT;
   if (ms > 0) groupSession.set(String(groupId), Date.now() + ms);
 }
 
@@ -477,7 +484,15 @@ function shouldReply(ev, cfg, selfId) {
   if (cfg.reply.groupReply) return true;
 
   // 处于对话状态 → 也回复（这就是「@ 一次后能连续聊」）
-  if (inGroupSession(ev.group_id, cfg)) {
+  //
+  // 用户要求"改成 @ 它再回复"，所以这个行为现在是**可选**的：
+  //   groupSession.enabled !== false  -> 保留（@ 之后一段时间内可以接着聊）
+  //   groupSession.enabled === false  -> 关掉，严格做到"不 @ 就不插话"
+  //
+  // 之所以做成开关而不是直接删：连续对话体验确实更好，
+  // 但它会让机器人在群里频繁插话（实测一次群里连发 5 条）。
+  // 两种需求都合理，交给配置决定。
+  if (cfg.reply.groupSession?.enabled !== false && inGroupSession(ev.group_id, cfg)) {
     touchGroupSession(ev.group_id, cfg); // 有互动就续期
     return true;
   }
@@ -2438,7 +2453,9 @@ async function main() {
         (ev.sender?.card || ev.sender?.nickname || ev.user_id) + ' (mid=' + ev.message_id + ')');
 
     // 记录所有进来的话（含没触发回复的，这样上下文更完整）
-    remember(key, 'user', text, cfg.reply.contextTurns);
+    // 群里带上说话人 QQ，供档案提炼按人归类
+    remember(key, 'user', text, cfg.reply.contextTurns,
+             ev.message_type === 'group' ? ev.user_id : undefined);
 
     // 对方回了 → 说明主动聊天没被冷落，清空计数
     if (awaitingReply.has(key)) {
