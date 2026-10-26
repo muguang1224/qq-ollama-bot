@@ -1562,14 +1562,69 @@ function startBiliShare(bot, cfg) {
       }, cfg);
       if (!pick || !pick.message) return;
 
-      await bot.sendPrivate(owner, pick.message);
+      // 挑中的那个视频。
+      //
+      // 坑：模型返回的 bvid 经常对不上（少一位、大小写错），
+      // 直接 find 会失败并退到 fresh[0]，结果文字说 A、链接给 B。
+      // 所以按 bvid → 标题 → 编号 三级兜底，标题匹配用去标点后的包含关系。
+      const norm = (s) => String(s || '')
+        .replace(/[《》【】\[\]（）()\s·:：,，.。!！?？\-_|]/g, '');
+      const byBvid = fresh.find((v) => v.bvid && pick.bvid &&
+                                    v.bvid.toLowerCase() === String(pick.bvid).toLowerCase());
+      let byTitle = null;
+      if (!byBvid) {
+        const t = norm(pick.title || pick.message);
+        if (t) {
+          byTitle = fresh.find((v) => {
+            const vt = norm(v.title);
+            if (!vt) return false;
+            // 双向包含：标题被提到，或提到的那段属于标题
+            if (t.includes(vt) || vt.includes(t)) return true;
+            // 再退一步：标题前 8 个字出现过
+            const core = vt.slice(0, 8);
+            return core.length >= 4 && t.includes(core);
+          });
+        }
+      }
+      const byIndex = (!byBvid && !byTitle && Number.isInteger(pick.index) && pick.index >= 0)
+        ? fresh[pick.index] : null;
+      const picked = byBvid || byTitle || byIndex || fresh[0];
+
+      if (!byBvid) {
+        log('  ⚠️ bvid 没对上（模型给的是 ' + (pick.bvid || '空') + '），' +
+            (byTitle ? '按标题匹配到「' + picked.title.slice(0, 20) + '」'
+             : byIndex ? '按编号匹配到「' + picked.title.slice(0, 20) + '」'
+             : '⚠️ 都没匹配上，退到第一条「' + picked.title.slice(0, 20) + '」'));
+      }
+
+      // —— 发送：文字 + 链接分两条 ——
+      // 只发标题对方还得自己去搜，不算分享。分两条发是因为：
+      //   · 文字和链接混在一条里，QQ 的链接预览会把文字挤没
+      //   · 先说一句、再甩链接，更像真人分享的习惯
+      let outMsg = pick.message;
+
+      // 兜底保险：如果连标题都没匹配上（说明模型记错了/编了标题），
+      // 那句文字里提到的视频多半是它自己发挥的，直接发会配错链接。
+      // 这种情况把话换成一句不指名的，保证"说什么就发什么"。
+      if (!byBvid && !byTitle && !byIndex) {
+        outMsg = '欸 B站首页有个视频看着挺有意思的';
+        log('  ⚠️ 匹配全失败，文字改为不指名的说法，避免文不对图');
+      }
+
+      await bot.sendPrivate(owner, outMsg);
+      if (picked.url) {
+        await new Promise((r) => setTimeout(r, 800 + Math.floor(Math.random() * 700)));
+        await bot.sendPrivate(owner, picked.url);
+      }
+
       st.history = [...st.history, {
-        at: Date.now(), bvid: pick.bvid || fresh[0].bvid,
-        title: (fresh.find((v) => v.bvid === pick.bvid) || fresh[0]).title,
-        message: pick.message,
+        at: Date.now(), bvid: picked.bvid,
+        title: picked.title,
+        message: outMsg,
       }].slice(-100);
       saveBiliState(st);
-      log('📺 主动分享 B 站: ' + pick.message + '   [' + (pick.reason || '') + ']');
+      log('📺 主动分享 B 站: ' + outMsg + '  →  ' + picked.url +
+          '   [' + (pick.reason || '') + ']');
     } catch (e) {
       log('B站分享出错：' + e.message);
     }
@@ -2209,8 +2264,11 @@ async function main() {
             log('  📺 热门拿到 ' + pop.videos.length + ' 条');
             systemPrompt += '\n\n【B 站当前热门，你刚查到的真实数据】\n' +
               Bili.formatVideos(pop.videos) +
+              '\n\n【对应的链接（要发给对方的话就用这些，原样贴，别改）】\n' +
+              pop.videos.map((v, i) => (i + 1) + '. ' + v.url).join('\n') +
               '\n\n（这是真实的 B 站热门列表。挑一两个自然地说说，' +
               '比如哪个有意思、谁播放高。别念列表，别说是"查到的"，像自己刚刷到一样。' +
+              '对方感兴趣的话，**把对应链接一起发给他**（单独一行贴 URL，别改链接）。' +
               '但你只是看到了标题和播放量，**没看过视频内容** —— 别编里面讲了什么。）';
           } else {
             log('  📺 热门没拿到: ' + (pop.error || ''));

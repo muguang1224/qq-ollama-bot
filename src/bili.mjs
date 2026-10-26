@@ -230,8 +230,11 @@ ${past}
   「欸 B站有个XX 看着好离谱」「刚刷到个XX 有点想看」。
 - **不要说"我查了一下""根据数据""播放量显示"**这种话，像自己刷到的一样。
 - **只看到了标题和播放量，没看过视频内容** —— 所以别编里面讲了什么。
-- 不用发链接。
-- 只输出 JSON：{"bvid":"挑中的BV号","message":"要说的话","reason":"为什么挑这个"}`;
+- message 里**不要**包含链接，链接由程序单独拼。
+- 你必须原样输出你挑中的那个视频的**编号**和**BV号**（照抄，别改），
+  因为程序要用它去对应链接 —— 抄错的话就会配错链接。
+- 只输出 JSON：
+  {"index":1,"bvid":"BV...","title":"原样抄的标题","message":"要说的话","reason":"为什么挑这个"}`;
 
   // 由调用方注入了 chat 就用它，否则用 cfg 里的 ollamaChat（如果传了）
   const caller = chat || cfg?.__chat;
@@ -247,7 +250,13 @@ ${past}
     const j = JSON.parse(m[0]);
     const msg = String(j.message || '').trim().slice(0, 100);
     if (!msg) return null;
-    return { bvid: String(j.bvid || '').trim(), message: msg, reason: String(j.reason || '').slice(0, 60) };
+    return {
+      bvid: String(j.bvid || '').trim(),
+      index: Number.isInteger(j.index) ? j.index - 1 : null,   // 模型给的是 1-based
+      title: String(j.title || '').trim().slice(0, 80),
+      message: msg,
+      reason: String(j.reason || '').slice(0, 60),
+    };
   } catch {
     return null;
   }
