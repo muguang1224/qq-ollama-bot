@@ -1080,28 +1080,60 @@ function hasVideoSeg(ev) {
 }
 
 /**
- * 视频后台理解。
+ * 视频理解。
  *
- * 视频要下载 + 抽帧 + 逐帧识别，几十秒起步。
- * **绝不能让它挡住回复** —— 所以丢到后台，
- * 理解到的内容写进上下文，下一轮聊天时它就知道那个视频是什么了。
+ * 设计演进（这段历史值得留着）：
+ *
+ * v1：完全后台，不挡回复。
+ *     结果是回复先发出去（「视频是啥呀？我有点好奇」），
+ *     84 秒后才识别完 —— 用户看到的是机器人明明在看却装作没看见。
+ *
+ * v2（现在）：等一下再回复。
+ *     收到视频时先给个"正在看"的信号，然后等识别结果，
+ *     拿到内容后连同回复一起发出去。这样它是真的在"看了再说"。
+ *
+ *     等待有上限（waitMs，默认 100 秒），超时就退回 v1 的行为 ——
+ *     后台继续识别，先把回复发出去，总比让用户干等强。
+ *
+ * @returns {Promise<{summary?:string, waited:boolean, timedOut:boolean}>}
  */
 const videoBusy = new Set();
 
-function understandVideoInBackground(bot, ev, key) {
-  // 同一个人同时只处理一个视频，避免堆积拖垮机器
-  if (videoBusy.has(key)) { log('  🎬 已有视频在处理，跳过'); return; }
+async function understandVideoBeforeReply(bot, ev, key, log) {
+  const vc = cfg_cache.video || {};
+  if (videoBusy.has(key)) {
+    log('  🎬 已有视频在处理，这次不等');
+    return { waited: false, timedOut: true };
+  }
   videoBusy.add(key);
 
+  const waitMs = vc.waitMs ?? 100000;
   const t0 = Date.now();
-  withTimeout(describeIncomingVideo(bot, ev, key), MEDIA_TIMEOUT.video, '视频识别')
-    .then((r) => {
-      if (r?.summary) {
-        log('  🎬 视频已理解（耗时 ' + ((Date.now() - t0) / 1000).toFixed(0) + 's），下轮对话可用');
-      }
-    })
-    .catch((e) => log('  ⚠️ ' + e.message + '（不影响回复）'))
-    .finally(() => videoBusy.delete(key));
+  let summary = null;
+  let timedOut = false;
+
+  try {
+    const task = describeIncomingVideo(bot, ev, key)
+      .then((r) => { summary = r?.summary || null; return r; })
+      .catch((e) => { log('  ⚠️ 视频识别失败: ' + e.message); return null; })
+      .finally(() => videoBusy.delete(key));
+
+    // 等，但不超过 waitMs
+    const timeout = new Promise((r) => setTimeout(() => r('__TIMEOUT__'), waitMs));
+    const winner = await Promise.race([task, timeout]);
+
+    if (winner === '__TIMEOUT__') {
+      timedOut = true;
+      log('  🎬 识别还没完（已等 ' + ((Date.now() - t0) / 1000).toFixed(0) +
+          's），先回复，识别继续在后台跑');
+    } else if (summary) {
+      log('  🎬 视频已理解（耗时 ' + ((Date.now() - t0) / 1000).toFixed(0) + 's）');
+    }
+  } catch (e) {
+    log('  ⚠️ 视频处理异常: ' + e.message);
+  }
+
+  return { summary, waited: true, timedOut };
 }
 
 /** 缓存配置引用（供 collectStickers 使用） */
@@ -2260,20 +2292,27 @@ async function main() {
     //   - 视频(几十秒)：丢到后台跑，【先回复】再说
     await understandMedia(bot, ev, key, { skipVideo: true });
 
-    // 视频单独后台处理：先回复，理解结果留给下一轮
+    // 视频：等一下，识别完再回复。
+    //
+    // v1 是纯后台（先回复、结果留到下一轮），实测体验很差：
+    // 用户发了视频，机器人回「视频是啥呀？我有点好奇」，
+    // 84 秒后才识别完 —— 明明在看却装作没看见。
+    // 现在改成等（有上限），拿到内容一起回复。超时再退回旧行为。
     if (cfg.video?.enabled !== false && hasVideoSeg(ev)) {
-      // 让模型知道"对方发了个视频，我在看"，免得它当作没收到
-      try {
-        const hist = history(key);
-        if (hist && hist.length) {
-          const last = [...hist].reverse().find((m) => m.role === 'user');
-          if (last && !/\[对方发了一段视频/.test(String(last.content || ''))) {
-            last.content = String(last.content || '') +
-              '\n[对方发了一段视频，你还没看完，可以先应一声]';
+      const vr = await understandVideoBeforeReply(bot, ev, key, log);
+      if (!vr.summary) {
+        // 没等到结果：告诉模型"你还在看"，先应一声
+        try {
+          const hist = history(key);
+          if (hist && hist.length) {
+            const last = [...hist].reverse().find((m) => m.role === 'user');
+            if (last && !/\[对方发了一段视频/.test(String(last.content || ''))) {
+              last.content = String(last.content || '') +
+                '\n[对方发了一段视频，你还在看，可以先应一声]';
+            }
           }
-        }
-      } catch {}
-      understandVideoInBackground(bot, ev, key);
+        } catch {}
+      }
     }
 
     // —— 情绪更新：分析这条消息对心情/亲密度的影响 ——
