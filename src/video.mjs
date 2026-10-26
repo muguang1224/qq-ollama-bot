@@ -235,10 +235,23 @@ export async function describeVideo(frames, cfg, describeFrame, log, duration) {
 /**
  * 生成给模型看的描述文本。
  *
- * 必须明确告诉它「这只是抽样」—— 否则它会以为自己看完了整个视频，
- * 然后拿 8 个瞬间去讲完整剧情，那就是编造。
+ * ⚠️ 这里踩过一个坑，值得记下来：
+ *
+ * 原来结尾固定写「中间的过程、人物说的话、以及声音你都没有听到」。
+ * 本意是提醒它别编剧情，但**当 ASR 已经给出台词时，这句话变成了自我否定** ——
+ * 上下文里前面刚列出「【视频里说的话】0s: 广东省最终兵器...」，
+ * 后面紧接着说「人物说的话你没听到」，模型直接懵了，
+ * 于是回复变成「发文件过来了吗？我看看里面是什么呀」——
+ * 明明有一整套画面和台词，它却当成没收到。
+ *
+ * 现在分两种情况写，措辞必须和实际给了什么数据一致：
+ *   · 只有画面（ASR 没跑或没识别人声）→ 说明过程、声音都没有
+ *   · 有台词 → 说明可以引用台词，只是转写可能有错
+ *
+ * @param {object} video { duration, summary }
+ * @param {boolean} hasTranscript 是否附带了台词
  */
-export function renderVideoNote(video) {
+export function renderVideoNote(video, hasTranscript = false) {
   if (!video) return '';
   const bits = [];
   if (video.duration) bits.push('时长约 ' + Math.round(video.duration) + ' 秒');
@@ -247,8 +260,12 @@ export function renderVideoNote(video) {
     bits.push('画面按时间抽样：' + String(video.summary).replace(/[。；;，,、\s]+$/, ''));
   }
   if (!bits.length) return '';
-  return '\n（对方发了一段视频：' + bits.join('，') +
-    '。这是每隔几秒抽一帧看到的画面，' +
-    '中间的过程、人物说的话、以及声音你都没有听到 —— ' +
-    '所以可以聊画面里出现的东西，但别断言"剧情讲了什么"。）';
+
+  const tail = hasTranscript
+    ? '。这是每隔几秒抽一帧看到的画面，台词是机器转写的（方言口音可能听错）。' +
+      '画面和台词里出现的东西都可以聊，但别编造中间没抽到的过程。'
+    : '。这是每隔几秒抽一帧看到的画面，中间的过程和声音你都没有 —— ' +
+      '所以可以聊画面里出现的东西，但别断言"剧情讲了什么"。';
+
+  return '\n（对方发了一段视频：' + bits.join('，') + tail + '）';
 }

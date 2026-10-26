@@ -901,8 +901,11 @@ async function describeIncomingVideo(bot, ev, key) {
     }
 
     // 写进上下文：画面 + 台词
-    const note = Video.renderVideoNote({ duration, summary }) +
-                 (asr?.ok ? Asr.renderTranscript(asr) : '');
+    // hasTranscript 要如实传 —— renderVideoNote 会据此决定措辞
+    // （有台词时不能说"你没听到声音"，否则模型会自我否定）
+    const hasTranscript = !!(asr?.ok && asr.segments?.length);
+    const note = Video.renderVideoNote({ duration, summary }, hasTranscript) +
+                 (hasTranscript ? Asr.renderTranscript(asr) : '');
     const hist = history(key);
     if (hist && hist.length) {
       const last = [...hist].reverse().find((m) => m.role === 'user');
