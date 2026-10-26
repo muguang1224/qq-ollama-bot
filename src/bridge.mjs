@@ -1153,6 +1153,16 @@ async function understandVideoBeforeReply(bot, ev, key, log) {
       timedOut = true;
       log('  🎬 识别还没完（已等 ' + ((Date.now() - t0) / 1000).toFixed(0) +
           's），先回复，识别继续在后台跑');
+
+      // 超时了，但识别还在跑。等它完成后**主动补一句** ——
+      // 否则用户看到的是"机器人问了一句视频是啥"然后就没下文了，
+      // 而实际上它几十秒后就看完了。
+      task.then((r) => {
+        const s = r?.summary;
+        if (!s) return;
+        log('  🎬 后台识别完成，主动补一句');
+        notifyVideoDone(bot, ev, s, r?.asr);
+      }).catch(() => {});
     } else if (summary) {
       log('  🎬 视频已理解（耗时 ' + ((Date.now() - t0) / 1000).toFixed(0) + 's）');
     }
@@ -1163,6 +1173,57 @@ async function understandVideoBeforeReply(bot, ev, key, log) {
   return { summary, waited: true, timedOut };
 }
 
+/**
+ * 视频在后台识别完之后，主动补一句「我看完了」。
+ *
+ * 为什么需要：如果识别超过了等待上限（waitMs），流程是
+ * "先回复 → 后台继续识别"。但后台出结果时如果什么都不做，
+ * 用户看到的就是机器人问了一句「视频是啥呀」然后没了下文 ——
+ * 明明它几十秒后就看完了。
+ *
+ * 所以这里在结果出来时，再发一条自然的话把内容说出来。
+ */
+async function notifyVideoDone(bot, ev, summary, asr) {
+  try {
+    const key = String(ev.message_type === 'group' ? 'g:' + ev.group_id : 'p:' + ev.user_id);
+    const lines = summary.split(/\s{2,}/).filter(Boolean).slice(0, 6).join('\n');
+
+    // 让模型用自己的口吻把内容说出来，不要报菜名
+    const sys = PERSONA + '\n\n【当前任务】\n' +
+      '你刚看完对方发的视频，现在随口跟他说说看到了什么。\n' +
+      '要求：\n' +
+      '- 一句话，15~40 字，自然口语\n' +
+      '- 别念清单，别用"根据画面抽样"这种说法\n' +
+      '- 只说画面里真实出现的东西，别编剧情\n' +
+      (asr?.segments?.length
+        ? '- 如果能引用一句台词会更像真的看过，但字幕是机器转写的，可能有错\n'
+        : '') +
+      '\n【视频画面（按时间）】\n' + lines +
+      (asr?.segments?.length
+        ? '\n\n【视频里的台词（机器转写，可能有错）】\n' + asr.text.slice(0, 300)
+        : '');
+
+    const out = await ollamaChat(
+      [{ role: 'system', content: sys },
+       { role: 'user', content: '（视频看完了，说一句）' }],
+      { ...cfg_cache.cfg, reply: { ...cfg_cache.cfg?.reply, maxTokens: 100 } }
+    );
+    const msg = sanitize(String(out || '').trim(), {
+      isOwner: !!cfg_cache.cfg?.bot?.owner &&
+               String(ev.user_id) === String(cfg_cache.cfg.bot.owner),
+      ownerName: cfg_cache.cfg?.bot?.ownerName || '爸爸',
+      isGroup: ev.message_type === 'group',
+    });
+    if (!msg) return;
+
+    if (ev.message_type === 'group') await bot.sendGroup(ev.group_id, msg);
+    else await bot.sendPrivate(ev.user_id, msg);
+    log('  🎬 补发：' + msg);
+  } catch (e) {
+    log('  🎬 补发失败: ' + e.message);
+  }
+}
+
 /** 缓存配置引用（供 collectStickers 使用） */
 /** 配置缓存（模块级函数用它，避免拿不到 main() 里的 cfg） */
 const cfg_cache = {
@@ -1170,8 +1231,9 @@ const cfg_cache = {
   vision: true,
   stickers: { enabled: true, chance: 0.25, cooldownMin: 20 },
   followUp: { enabled: true, chance: 0.3 },
-  video: { enabled: true, frames: 3, width: 256, maxMB: 80 },
+  video: { enabled: true, frames: 8, width: 256, maxMB: 200, waitMs: 240000 },
   audio: { enabled: true },
+  asr: { enabled: true },
   cfg: null,
 };
 
@@ -2336,14 +2398,24 @@ async function main() {
           ((cfg_cache.video?.waitMs ?? 100000) / 1000).toFixed(0) + 's）');
       const vr = await understandVideoBeforeReply(bot, ev, key, log);
       if (!vr.summary) {
-        // 没等到结果：告诉模型"你还在看"，先应一声
+        // 没等到结果，先应一声。
+        //
+        // 实测过一次翻车：等满 100 秒超时后，模型拿到含糊的
+        // 「你还在看，可以先应一声」，回了一句
+        // 「怎么一直发视频呀？发这么多我有点晕头转向呢」——
+        // 完全跑偏。问题在于提示词没给它"该说什么"的方向。
+        //
+        // 现在明确告诉它：视频正在解析、你现在还没看到内容、
+        // 可以问一句"这视频是什么呀"这类，别说自己在看却说不出东西。
         try {
           const hist = history(key);
           if (hist && hist.length) {
             const last = [...hist].reverse().find((m) => m.role === 'user');
-            if (last && !/\[对方发了一段视频/.test(String(last.content || ''))) {
+            if (last && !/\[视频还在解析中/.test(String(last.content || ''))) {
               last.content = String(last.content || '') +
-                '\n[对方发了一段视频，你还在看，可以先应一声]';
+                '\n[对方发了视频，但视频还在解析中，你现在还没看到内容。' +
+                '可以好奇地问一句"这视频是啥呀""等下我看完跟你说"，' +
+                '但绝对不要说"我看过了"或者编内容。]';
             }
           }
         } catch {}
